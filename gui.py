@@ -2,12 +2,13 @@ import math
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import pandas as pd
-from playwright.sync_api import sync_playwright, TimeoutError as PwTimeoutError
+from playwright.sync_api import sync_playwright, TimeoutError as PwTimeoutError, Error as PwError
 
 # ===== Portal settings =====
 COURSE_PAGE_URL = "https://portal.alquds.edu/en/registration/marks/course_list"
@@ -15,12 +16,9 @@ ROW_LOCATOR = "tr.ev_dhx_web, tr.odd_dhx_web"
 
 # Portal column indexes (0-based td)
 IDX_STUDENT_NUMBER = 1
-IDX_FIRST = 3
-IDX_SECOND = 4
-IDX_QUIZ = 5
-IDX_FINAL = 6
 
 DEFAULT_STATE_PATH = "state.json"
+PACE_MS = 120
 
 
 # ===== helpers =====
@@ -43,16 +41,17 @@ def normalize_grade(x) -> int:
     return round_half_up(float(x))
 
 
-def row_for_student(page, sid: str):
+def row_for_student(page, sid: str, id_td_index: int):
     rows = page.locator(ROW_LOCATOR)
+    td_n = id_td_index + 1
     # exact match if supported
     try:
         return rows.filter(
-            has=page.locator(f'td:nth-child({IDX_STUDENT_NUMBER + 1}):text-is("{sid}")')
+            has=page.locator(f'td:nth-child({td_n}):text-is("{sid}")')
         ).first
     except Exception:
         return rows.filter(
-            has=page.locator(f"td:nth-child({IDX_STUDENT_NUMBER + 1})", has_text=sid)
+            has=page.locator(f"td:nth-child({td_n})", has_text=sid)
         ).first
 
 
@@ -95,14 +94,8 @@ class App(tk.Tk):
         self.excel_path = tk.StringVar()
         self.state_path = tk.StringVar(value=str(Path.cwd() / DEFAULT_STATE_PATH))
         self.sheet_name = tk.StringVar()
-
-        self.col_id = tk.StringVar()
-        self.col_first = tk.StringVar()
-        self.col_second = tk.StringVar()
-        self.col_quiz = tk.StringVar()
-        self.col_final = tk.StringVar()
-
-        self.pace_ms = tk.IntVar(value=120)
+        self.map_rows = []
+        self._mappings = []
 
         self._stop = False
         self._worker = None
@@ -119,44 +112,36 @@ class App(tk.Tk):
         ttk.Entry(f1, textvariable=self.excel_path, width=70).grid(row=0, column=1, sticky="we", **pad)
         ttk.Button(f1, text="Browse…", command=self.pick_excel).grid(row=0, column=2, **pad)
 
-        ttk.Label(f1, text="state.json:").grid(row=1, column=0, sticky="w", **pad)
-        ttk.Entry(f1, textvariable=self.state_path, width=70).grid(row=1, column=1, sticky="we", **pad)
-        ttk.Button(f1, text="Browse…", command=self.pick_state).grid(row=1, column=2, **pad)
-
         f1.columnconfigure(1, weight=1)
 
         f2 = ttk.LabelFrame(self, text="2) Sheet")
         f2.pack(fill="x", **pad)
 
-        ttk.Button(f2, text="Load sheets", command=self.load_sheets).grid(row=0, column=0, **pad)
-        ttk.Label(f2, text="Sheet:").grid(row=0, column=1, sticky="e", **pad)
+        ttk.Label(f2, text="Sheet:").grid(row=0, column=0, sticky="e", **pad)
         self.sheet_combo = ttk.Combobox(f2, textvariable=self.sheet_name, state="readonly", width=40)
-        self.sheet_combo.grid(row=0, column=2, sticky="w", **pad)
+        self.sheet_combo.grid(row=0, column=1, sticky="w", **pad)
+        self.sheet_combo.bind("<<ComboboxSelected>>", lambda _e: self.load_columns())
 
         f3 = ttk.LabelFrame(self, text="3) Column mapping")
         f3.pack(fill="x", **pad)
 
-        self.cols_combo = {}
-        self._map_row(f3, 0, "Student ID", self.col_id)
-        self._map_row(f3, 1, "First", self.col_first)
-        self._map_row(f3, 2, "Second", self.col_second)
-        self._map_row(f3, 3, "Quiz", self.col_quiz)
-        self._map_row(f3, 4, "Final", self.col_final)
+        self.map_frame = f3
+        ttk.Label(f3, text="Index (1-based):").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Label(f3, text="Name:").grid(row=0, column=1, sticky="w", **pad)
+        ttk.Label(f3, text="Sheet column:").grid(row=0, column=2, sticky="w", **pad)
 
-        ttk.Button(f3, text="Load columns", command=self.load_columns).grid(row=5, column=0, **pad)
-        ttk.Button(f3, text="Auto-guess", command=self.auto_guess).grid(row=5, column=1, **pad)
+        self._add_mapping_row(name="Student ID", idx=IDX_STUDENT_NUMBER + 1)
+        self.map_add_btn = ttk.Button(f3, text="Add column", command=self.add_mapping_row)
+        self._refresh_mapping_controls()
 
         f4 = ttk.LabelFrame(self, text="4) Run")
         f4.pack(fill="x", **pad)
 
-        ttk.Label(f4, text="Pace (ms):").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Spinbox(f4, from_=0, to=2000, textvariable=self.pace_ms, width=8).grid(row=0, column=1, sticky="w", **pad)
-
         self.btn_start = ttk.Button(f4, text="Start Fill (no save)", command=self.start)
-        self.btn_start.grid(row=0, column=2, **pad)
+        self.btn_start.grid(row=0, column=0, **pad)
 
         self.btn_stop = ttk.Button(f4, text="Stop", command=self.stop, state="disabled")
-        self.btn_stop.grid(row=0, column=3, **pad)
+        self.btn_stop.grid(row=0, column=1, **pad)
 
         self.progress = ttk.Progressbar(f4, length=400, mode="determinate")
         self.progress.grid(row=1, column=0, columnspan=4, sticky="we", **pad)
@@ -166,12 +151,57 @@ class App(tk.Tk):
         self.log = tk.Text(f5, height=18, wrap="word")
         self.log.pack(fill="both", expand=True, padx=10, pady=10)
 
-    def _map_row(self, parent, r, label, var):
+    def _add_mapping_row(self, name="", idx=""):
         pad = {"padx": 10, "pady": 6}
-        ttk.Label(parent, text=f"{label}:").grid(row=r, column=0, sticky="w", **pad)
-        cb = ttk.Combobox(parent, textvariable=var, state="readonly", width=45)
-        cb.grid(row=r, column=1, sticky="w", **pad)
-        self.cols_combo[label] = cb
+        row = len(self.map_rows) + 1
+        idx_var = tk.StringVar(value=str(idx) if idx else "")
+        name_var = tk.StringVar(value=name)
+        sheet_var = tk.StringVar()
+
+        idx_entry = ttk.Entry(self.map_frame, textvariable=idx_var, width=4)
+        name_entry = ttk.Entry(self.map_frame, textvariable=name_var, width=15)
+        sheet_combo = ttk.Combobox(self.map_frame, textvariable=sheet_var, state="readonly", width=15)
+        row_data = {
+            "idx_var": idx_var,
+            "name_var": name_var,
+            "sheet_var": sheet_var,
+            "sheet_combo": sheet_combo,
+        }
+        remove_btn = ttk.Button(self.map_frame, text="Remove", command=lambda r=row_data: self.remove_mapping_row(r))
+
+        idx_entry.grid(row=row, column=0, sticky="w", **pad)
+        name_entry.grid(row=row, column=1, sticky="w", **pad)
+        sheet_combo.grid(row=row, column=2, sticky="w", **pad)
+        remove_btn.grid(row=row, column=3, sticky="w", **pad)
+
+        row_data["widgets"] = (idx_entry, name_entry, sheet_combo, remove_btn)
+        self.map_rows.append(row_data)
+
+    def _refresh_mapping_controls(self):
+        pad = {"padx": 10, "pady": 6}
+        for i, row in enumerate(self.map_rows, start=1):
+            for w in row["widgets"]:
+                w.grid_configure(row=i)
+        self.map_add_btn.grid(row=len(self.map_rows) + 1, column=0, sticky="w", **pad)
+
+    def add_mapping_row(self):
+        self._add_mapping_row()
+        if self.map_rows:
+            cols = self.map_rows[0]["sheet_combo"]["values"]
+            if cols:
+                self.map_rows[-1]["sheet_combo"]["values"] = cols
+        self._refresh_mapping_controls()
+
+    def remove_mapping_row(self, row_data):
+        if not self.map_rows or self.map_rows[0] is row_data:
+            return
+        try:
+            self.map_rows.remove(row_data)
+        except ValueError:
+            return
+        for w in row_data["widgets"]:
+            w.destroy()
+        self._refresh_mapping_controls()
 
     def log_line(self, s):
         self.log.insert("end", s + "\n")
@@ -184,11 +214,7 @@ class App(tk.Tk):
             self.excel_path.set(path)
             self.sheet_name.set("")
             self.log_line(f"[OK] Excel selected: {path}")
-
-    def pick_state(self):
-        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
-        if path:
-            self.state_path.set(path)
+            self.load_sheets()
 
     def load_sheets(self):
         path = self.excel_path.get().strip()
@@ -200,42 +226,51 @@ class App(tk.Tk):
             self.sheet_combo["values"] = list(xls.sheet_names)
             if xls.sheet_names:
                 self.sheet_name.set(xls.sheet_names[0])
+                self.load_columns()
             self.log_line(f"[OK] Sheets loaded: {list(xls.sheet_names)}")
         except Exception as e:
             messagebox.showerror("Excel error", str(e))
 
     def load_columns(self):
         path = self.excel_path.get().strip()
-        sheet = self.sheet_name.get().strip()
-        if not path or not sheet:
+        sheet_raw = self.sheet_name.get()
+        if not path or not sheet_raw.strip():
             messagebox.showerror("Missing", "Pick Excel + sheet first.")
             return
-        df = pd.read_excel(path, sheet_name=sheet, nrows=2)
+        df = pd.read_excel(path, sheet_name=sheet_raw, nrows=2)
         cols = list(df.columns)
-        for cb in self.cols_combo.values():
-            cb["values"] = cols
+        for row in self.map_rows:
+            row["sheet_combo"]["values"] = cols
         self.log_line(f"[OK] Columns loaded ({len(cols)}). Now map them.")
 
-    def auto_guess(self):
-        cols = self.cols_combo["Student ID"]["values"]
-        if not cols:
-            messagebox.showerror("Missing", "Click 'Load columns' first.")
-            return
+    def _collect_mappings(self):
+        if not self.map_rows:
+            messagebox.showerror("Missing", "Add at least one column mapping.")
+            return None
 
-        def pick(*needles):
-            for c in cols:
-                s = str(c).lower()
-                if all(n in s for n in needles):
-                    return c
-            return ""
+        mappings = []
+        for i, row in enumerate(self.map_rows, start=1):
+            idx_raw = row["idx_var"].get().strip()
+            name = row["name_var"].get().strip()
+            sheet_col = row["sheet_var"].get().strip()
 
-        self.col_id.set(pick("id") or pick("id number"))
-        self.col_first.set(pick("first", "/25") or pick("first"))
-        self.col_second.set(pick("second", "/25") or pick("second"))
-        self.col_quiz.set(pick("quiz") or pick("qiuz"))
-        self.col_final.set(pick("final") or pick("grade", "40") or pick("40"))
+            if not idx_raw or not name or not sheet_col:
+                messagebox.showerror("Missing", f"Complete mapping row {i}.")
+                return None
+            try:
+                idx = int(idx_raw)
+            except ValueError:
+                messagebox.showerror("Invalid", f"Index must be a number in row {i}.")
+                return None
+            if idx < 1:
+                messagebox.showerror("Invalid", f"Index must be 1 or greater in row {i}.")
+                return None
 
-        self.log_line("[OK] Auto-guess filled. Please verify mappings.")
+            mappings.append(
+                {"idx": idx - 1, "name": name, "sheet_col": sheet_col, "is_id": i == 1}
+            )
+
+        return mappings
 
     def start(self):
         if self._worker and self._worker.is_alive():
@@ -251,12 +286,12 @@ class App(tk.Tk):
         if not Path(self.state_path.get().strip()).exists():
             messagebox.showerror("Missing", "state.json not found. Create it first.")
             return
-        for name, var in [("Student ID", self.col_id), ("First", self.col_first), ("Second", self.col_second), ("Quiz", self.col_quiz), ("Final", self.col_final)]:
-            if not var.get().strip():
-                messagebox.showerror("Missing", f"Map column for: {name}")
-                return
+        mappings = self._collect_mappings()
+        if not mappings:
+            return
 
         self._stop = False
+        self._mappings = mappings
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.progress["value"] = 0
@@ -271,21 +306,19 @@ class App(tk.Tk):
     def _run_worker(self):
         try:
             excel = self.excel_path.get().strip()
-            sheet = self.sheet_name.get().strip()
+            sheet = self.sheet_name.get()
             state = self.state_path.get().strip()
-
-            col_id = self.col_id.get().strip()
-            col_first = self.col_first.get().strip()
-            col_second = self.col_second.get().strip()
-            col_quiz = self.col_quiz.get().strip()
-            col_final = self.col_final.get().strip()
+            mappings = list(self._mappings)
+            id_map = mappings[0]
+            value_maps = mappings[1:]
+            cols = [m["sheet_col"] for m in mappings]
 
             self.log_line("[INFO] Loading Excel…")
-            df = pd.read_excel(excel, sheet_name=sheet)[[col_id, col_first, col_second, col_quiz, col_final]].copy()
+            df = pd.read_excel(excel, sheet_name=sheet)[cols].copy()
 
-            df[col_id] = df[col_id].apply(normalize_id)
-            for c in [col_first, col_second, col_quiz, col_final]:
-                df[c] = df[c].apply(normalize_grade)
+            df[id_map["sheet_col"]] = df[id_map["sheet_col"]].apply(normalize_id)
+            for m in value_maps:
+                df[m["sheet_col"]] = df[m["sheet_col"]].apply(normalize_grade)
 
             total = len(df)
             self.progress["maximum"] = total
@@ -307,30 +340,31 @@ class App(tk.Tk):
                 page.locator(ROW_LOCATOR).first.wait_for(timeout=60_000)
                 self.log_line(f"[OK] Grid detected. Rows: {page.locator(ROW_LOCATOR).count()}")
 
-                pace = max(0, int(self.pace_ms.get())) / 1000.0
+                pace = max(0, int(PACE_MS)) / 1000.0
 
-                for i, r in enumerate(df.itertuples(index=False), start=1):
+                browser_ok = True
+                for i, r in enumerate(df.itertuples(index=False, name=None), start=1):
                     if self._stop:
                         self.log_line("[STOP] Stopped by user.")
                         break
 
-                    sid = getattr(r, col_id.replace(" ", "_")) if False else str(r[0])  # ignore; we use index positions below
-
-                    sid = str(r[0])
-                    first = int(r[1]); second = int(r[2]); quiz = int(r[3]); final = int(r[4])
-
-                    row = row_for_student(page, sid)
+                    row_data = dict(zip(cols, r))
+                    sid = str(row_data[id_map["sheet_col"]])
+                    row = row_for_student(page, sid, id_map["idx"])
                     try:
                         row.wait_for(timeout=6000)
                     except PwTimeoutError:
                         self.log_line(f"[MISSING] {sid}")
                         self.progress["value"] = i
                         continue
+                    except PwError as e:
+                        browser_ok = False
+                        self.log_line(f"[ERROR] {e}")
+                        self._popup("Browser closed", "The browser closed unexpectedly. Click Start again.")
+                        break
 
-                    edit_cell_commit(page, row, IDX_FIRST, first)
-                    edit_cell_commit(page, row, IDX_SECOND, second)
-                    edit_cell_commit(page, row, IDX_QUIZ, quiz)
-                    edit_cell_commit(page, row, IDX_FINAL, final)
+                    for m in value_maps:
+                        edit_cell_commit(page, row, m["idx"], int(row_data[m["sheet_col"]]))
 
                     if i % 10 == 0:
                         self.log_line(f"[PROGRESS] {i}/{total}")
@@ -339,15 +373,20 @@ class App(tk.Tk):
                     if pace:
                         time.sleep(pace)
 
-                self.log_line("[DONE] Filling completed.")
-                self._popup("Save", "Now click Save in the portal and confirm the popup.\nClick OK here when you are done, to close the browser.")
+                if browser_ok:
+                    self.log_line("[DONE] Filling completed.")
+                    self._popup("Save", "Now click Save in the portal and confirm the popup.\nClick OK here when you are done, to close the browser.")
 
-                context.storage_state(path=state)
-                browser.close()
+                    context.storage_state(path=state)
+                    browser.close()
 
         except Exception as e:
             self.log_line(f"[ERROR] {e}")
-            self._popup("Error", str(e))
+            self.log_line(traceback.format_exc().strip())
+            if "Event loop is closed" in str(e):
+                self._popup("Browser closed", "The browser closed unexpectedly. Click Start again.")
+            else:
+                self._popup("Error", str(e))
         finally:
             self.btn_start.config(state="normal")
             self.btn_stop.config(state="disabled")
