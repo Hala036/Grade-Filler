@@ -12,6 +12,7 @@ def main():
         print("Log in manually, then navigate to a page that clearly indicates you're logged in.")
         input("After you're fully logged in, press Enter here...")
 
+        # page.goto("https://portal.alquds.edu/en/registration/marks/course_list")
         context.storage_state(path="state.json")
         print("Saved session to state.json")
         browser.close()

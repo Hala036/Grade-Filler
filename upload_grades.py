@@ -1,4 +1,5 @@
 import math
+import sys
 import time
 from pathlib import Path
 
@@ -38,6 +39,7 @@ IDX_FIRST = 3
 IDX_SECOND = 4
 IDX_QUIZ = 5
 IDX_FINAL = 6
+IDX_TOTAL = 7
 
 
 # =========================
@@ -48,11 +50,38 @@ def round_half_up(x: float) -> int:
 
 
 def edit_cell_commit(page, row, td_index: int, value: int):
+    modifier = "Meta" if sys.platform == "darwin" else "Control"
+
+    page.bring_to_front()
+    page.locator("body").click()
+
     cell = row.locator("td").nth(td_index)
-    cell.click()
-    page.keyboard.press("Control+A")
-    page.keyboard.type(str(int(value)))
-    page.keyboard.press("Enter")
+    cell.scroll_into_view_if_needed()
+
+    for attempt in range(2):
+        cell.dblclick()
+        page.wait_for_timeout(80)
+
+        # Select all + replace
+        page.keyboard.press(f"{modifier}+A")
+
+        # Use insertText (more reliable on macOS than type with IME/keyboard layouts)
+        page.keyboard.insert_text(str(int(value)))
+
+        # Commit like human
+        page.keyboard.press("Tab")
+        page.wait_for_timeout(150)
+
+        shown = cell.inner_text().strip()
+
+        # If it updated, we're done
+        if shown != "":
+            return
+
+        # Otherwise retry after a small pause
+        page.wait_for_timeout(200)
+
+    raise RuntimeError(f"Edit failed: cell stayed blank after 2 attempts (td={td_index}, value={value}).")
 
 
 def row_for_student(page, sid: str):
@@ -128,9 +157,10 @@ def main():
                 print(f"[MISSING] {sid} not found in portal list")
                 continue
 
-            edit_cell_commit(page, row, IDX_FIRST,  int(r[COL_FIRST]));  time.sleep(0.01)
-            edit_cell_commit(page, row, IDX_SECOND, int(r[COL_SECOND])); time.sleep(0.01)
-            edit_cell_commit(page, row, IDX_QUIZ,   int(r[COL_QUIZ]));   time.sleep(0.01)
+            print(f"[UPDATING] {sid}: {r[COL_FIRST]}, {r[COL_SECOND]}, {r[COL_QUIZ]}, {r[COL_FINAL]}")
+            edit_cell_commit(page, row, IDX_FIRST,  int(r[COL_FIRST]));  time.sleep(0.05)
+            edit_cell_commit(page, row, IDX_SECOND, int(r[COL_SECOND])); time.sleep(0.05)
+            edit_cell_commit(page, row, IDX_QUIZ,   int(r[COL_QUIZ]));   time.sleep(0.05)
             edit_cell_commit(page, row, IDX_FINAL,  int(r[COL_FINAL]))
 
             time.sleep(PACE_SECONDS)
