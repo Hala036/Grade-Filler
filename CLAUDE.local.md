@@ -77,7 +77,7 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 
 - [x] **Popup detection + Mark Entry auto-pick: confirmed on the real portal** (user, 2026-11-19). The Mark Entry table is chosen without asking.
 - [x] **Decimals:** the portal accepts values like `36.8` (user, 2026-11-19).
-- [ ] **Edit focus click on the ID cell** (replaced the old `body.click()`). Confirm edits still commit (grades stay in the cells after a full run), and that clicking a row does nothing unwanted. Explained to the user 2026-11-20; awaiting their answer.
+- [x] **Edit focus click on the ID cell: confirmed on the real portal** (user, 2026-11-20). Grades are filled correctly and stay in their cells; each value is committed with Tab.
 - [ ] **Header labels: fixed, confirm on the real portal.** The popup's header has two rows with merged cells (`Mark` spans First 25 / Second 25 / Third 10; first `#` and last hidden column have no name), so no single row matched. Now `_DISCOVER_JS` lays the header out honouring rowspan/colspan and takes each column's lowest name. Tested in headless Chromium with the real header HTML the user pasted. Match Columns should no longer say names couldn't be read.
 - [ ] Merge `improving-UI` → `main` only after a successful real run.
 - [ ] No automated tests in the repo yet. Earlier checks were throwaway scripts: fake DHTMLX pages + headless Chromium, and a stub Flet page driving each step. Worth adding under `tests/`.
