@@ -29,7 +29,9 @@ double-click `.exe` with no terminal at all.
 
 | File | Role |
 |---|---|
-| `main.py` | Launcher: `python main.py` |
+| `main.py` | Launcher: `python main.py`; `--self-test` checks a build without opening the app |
+| `gradefiller/selftest.py` | Self-test: imports, Playwright driver, headless Edge/Chrome; writes `selftest.txt`, exit 0 = pass |
+| `.github/workflows/build-windows.yml` | Builds `GradeFiller.exe` on GitHub (Windows): manual run → Artifacts; tag `v*` → Release |
 | `gradefiller/app.py` | Flet wizard, 5 steps: Log In → Grades File → Course Table → Match Columns → Review & Fill |
 | `gradefiller/automation.py` | All browser + Excel work: `PortalSession`, grid discovery (`find_grids`, `GridInfo`), `scan_grid`, `load_sheet` / `excel_display_text`, `build_fill_plan`, `run_fill`, `edit_cell_commit` |
 | `gradefiller/matching.py` | Pure auto-matching: ID pair by shared values, grade pairs by name similarity |
@@ -56,6 +58,8 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 - **Optional round-up (off by default)** is the one exception to "no rounding". It goes by the first digit after the point, chosen per digit. The teacher's usual rule: .1–.4 up to .5, .5–.9 up to the next whole number (12.2 → 12.5, 12.5 → 13, 12 stays 12). Rounding must never lower a grade.
 
 ## Recent fixes (newest first)
+
+- **GitHub build for the `.exe`** (branch `windows-exe`). `build-windows.yml` on `windows-latest`, Python 3.12: installs `requirements.txt` + `pyinstaller`, `flet pack main.py --name GradeFiller` (single file, no console), then runs `GradeFiller.exe --self-test` and fails unless Edge started from inside the bundle. Manual "Run workflow" → download from the run's Artifacts; pushing tag `vX.Y.Z` also creates a Release, so the newest is always at `releases/latest/download/GradeFiller.exe`.
 
 - **Uses the installed browser** (branch `windows-exe`). `PortalSession._launch_browser` tries `BROWSER_CHANNELS = ("msedge", "chrome", None)`: Edge (always on Windows), then Chrome (the user's Mac), then Playwright's downloaded Chromium. None found → "Couldn't open a web browser. Please install Microsoft Edge or Google Chrome and try again." Tested on the Mac (Edge missing → Chrome 157). Not yet tested with Edge on Windows. Each run is a clean browser profile; the login lives in the app's `state.json`.
 
