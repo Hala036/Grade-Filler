@@ -80,6 +80,9 @@ class GradeFillerApp:
         # Step 3/4
         self.grid: list[automation.GridColumn] = []
         self.grid_choices: list[automation.GridInfo] = []  # all tables found, best first
+        self.table_match: Optional[matching.GridMatch] = None
+        self._show_table_picker = False  # expanded when unsure, or on "Change"
+        self._show_id_editor = False
         self.labels_found = True
         self.id_portal: Optional[int] = None
         self.id_excel: Optional[str] = None
@@ -488,8 +491,13 @@ class GradeFillerApp:
                     "and shows the students, then try again."
                 )
                 return
-            self.grid_choices = grids
-            self._use_grid(grids[0])
+            ranked, confident = matching.rank_grids(grids, self.df)
+            self.grid_choices = [m.grid for m in ranked]
+            self.table_match = ranked[0]
+            # Ask only when there's a real choice and the data didn't settle it.
+            self._show_table_picker = len(ranked) > 1 and not confident
+            self._show_id_editor = False
+            self._use_grid(ranked[0].grid)
             on_done()
 
         def err(e):
@@ -614,30 +622,40 @@ class GradeFillerApp:
             id_portal_dd.on_select = on_id_portal
             id_excel_dd.on_select = on_id_excel
 
-            id_check = ft.Text("", size=13)
+            found = total = 0
             if self.id_portal is not None and self.id_excel is not None:
                 found, total = matching.id_overlap(self._grid_col(self.id_portal), self.df, self.id_excel)
-                if total and found == total:
-                    self._set_status(id_check, f"✓ All {total} students in the portal table are in this Excel column.", OK)
-                elif found:
-                    self._set_status(
-                        id_check,
-                        f"✓ {found} of {total} students in the portal table were found in this Excel column.",
-                        OK,
-                    )
+            id_ok = found > 0
+
+            def toggle_id_editor(_):
+                self._show_id_editor = not self._show_id_editor
+                render()
+
+            if id_ok and not self._show_id_editor:
+                # Matched automatically: one line instead of two dropdowns.
+                id_section = self._fact(
+                    ft.Icons.CHECK_CIRCLE,
+                    f"{found} of {total} students found in your sheet.",
+                    OK,
+                    action=ft.TextButton("Change", on_click=toggle_id_editor),
+                )
+            else:
+                if id_ok:
+                    msg, color = f"✓ {found} of {total} students found in your sheet.", OK
                 else:
-                    self._set_status(
-                        id_check,
-                        "None of the portal's student IDs appear in this Excel column. Check that both "
-                        "dropdowns are ID columns and that this is the right sheet. If the grade table "
-                        "opens in a popup, make sure the popup is open, then click “Read the browser again” below.",
+                    msg, color = (
+                        "Choose the student ID column on each side. (No matching student IDs were found. "
+                        "Is this the right sheet and table?)",
                         ERROR,
                     )
-
-            id_card = self._card(
-                "1. How to find each student",
-                [ft.Row([id_portal_dd, id_excel_dd], spacing=12), id_check],
-            )
+                id_section = ft.Column(
+                    [
+                        ft.Text(msg, color=color, size=13),
+                        ft.Row([id_portal_dd, id_excel_dd], spacing=12),
+                    ]
+                    + ([ft.TextButton("Done", on_click=toggle_id_editor)] if id_ok else []),
+                    spacing=8,
+                )
 
             # --- Grade rows card ---
             portal_choices = matching.portal_fillable_columns(self.grid, self.id_portal)
@@ -701,7 +719,7 @@ class GradeFillerApp:
                 render()
 
             blank_cb = ft.Checkbox(
-                label="Write 0 when an Excel cell is blank (otherwise blank cells are left unchanged in the portal)",
+                label="Write 0 for blank Excel cells (otherwise they're left as they are)",
                 value=self.blank_as_zero,
             )
 
@@ -712,12 +730,11 @@ class GradeFillerApp:
 
             filled = sum(1 for p in self.grade_pairs if p["portal"] is not None and p["excel"])
             grades_card = self._card(
-                "2. Which grades to fill",
+                "Grades to fill",
                 [
                     ft.Text(
-                        "Add one row per exam/column you want to fill — one, three, or as many as you need. "
-                        + ("Rows with matching names were filled in for you; please check them."
-                           if filled else "No column names matched automatically, so pick them yourself."),
+                        "Pre-filled where the names match. Please check them." if filled
+                        else "Pick which Excel column goes into which portal column.",
                         size=13,
                         color=INFO,
                     ),
@@ -728,8 +745,13 @@ class GradeFillerApp:
             )
 
             notices = []
-            if len(self.grid_choices) > 1:
-                current = self._session().grid
+            current = self._session().grid
+
+            def toggle_table_picker(_):
+                self._show_table_picker = not self._show_table_picker
+                render()
+
+            if len(self.grid_choices) > 1 and self._show_table_picker:
                 table_dd = ft.Dropdown(
                     label="Table to fill",
                     options=[
@@ -745,29 +767,39 @@ class GradeFillerApp:
                     if info:
                         self._use_grid(info)
                         self._suggest_mapping()
+                        self._show_id_editor = False
                         render()
 
                 table_dd.on_select = on_table
                 notices.append(
-                    self._card(
-                        f"{len(self.grid_choices)} tables are open in the browser",
+                    ft.Column(
                         [
                             ft.Text(
-                                "The one in front (e.g. the popup with the students' grades) was picked. "
-                                "If the columns below look wrong, choose the other table here.",
+                                "Several tables are open in the browser. Which one has these students' grades?",
+                                color=WARN if not id_ok else INFO,
                                 size=13,
-                                color=INFO,
                             ),
                             ft.Row([table_dd]),
-                        ],
+                        ]
+                        + ([ft.TextButton("Done", on_click=toggle_table_picker)] if id_ok else []),
+                        spacing=8,
                     )
                 )
+            elif current is not None:
+                notices.append(
+                    self._fact(
+                        ft.Icons.TABLE_CHART,
+                        f"Filling the portal table with {current.rows} students.",
+                        INFO,
+                        action=ft.TextButton("Wrong table?", on_click=toggle_table_picker)
+                        if len(self.grid_choices) > 1 else None,
+                    )
+                )
+            notices.append(id_section)
             if not self.labels_found:
                 notices.append(
-                    self._notice(
-                        "The portal's column names couldn't be read, so portal columns are shown by "
-                        "position (Column 1 is the leftmost) with the value currently in them.",
-                    )
+                    ft.Text("Portal column names couldn't be read; they're numbered left to right.",
+                            size=12, color=INFO)
                 )
 
             def rescan(_):
@@ -783,7 +815,7 @@ class GradeFillerApp:
                 self._scan(on_done=lambda: (self._set_status(status, ""), self._go_to(STEP_MAP)), on_fail=fail)
 
             rescan_btn = ft.TextButton(
-                "Wrong or changed table? Read the browser again",
+                "Opened a different table? Read the browser again",
                 icon=ft.Icons.REFRESH,
                 on_click=rescan,
             )
@@ -798,7 +830,6 @@ class GradeFillerApp:
                 self._go_to(STEP_RUN)
 
             holder.controls = notices + [
-                id_card,
                 grades_card,
                 ft.Row([rescan_btn]),
                 status,
@@ -808,8 +839,8 @@ class GradeFillerApp:
 
         render()
         return self._step_layout(
-            "Step 4: Match the Excel columns to the portal",
-            "Each dropdown shows an example value so you can tell the columns apart.",
+            "Step 4: Match columns",
+            "",
             [holder],
             back_to=STEP_GRID,
         )
@@ -841,51 +872,44 @@ class GradeFillerApp:
             self._fact(
                 ft.Icons.EDIT_NOTE,
                 f"{len(plan.students)} students will be updated "
-                f"({plan.cell_count} grade cells in: {', '.join(m.portal_label for m in job.grade_mappings)}).",
+                f"({', '.join(m.portal_label for m in job.grade_mappings)}).",
                 OK if plan.students else ERROR,
             )
         ]
-        summary.append(
-            self._fact(ft.Icons.CONTENT_COPY, "Grades are copied exactly as Excel shows them (no extra rounding).")
-        )
-        if plan.blank_cells:
-            summary.append(self._fact(ft.Icons.REMOVE, f"{plan.blank_cells} blank Excel cells will be left unchanged."))
+
+        # Only things worth a second look stay visible; the ID lists and
+        # minor notes go behind "Show details".
+        warnings, details = [], []
         if plan.not_in_portal:
-            summary.append(
-                self._fact(
-                    ft.Icons.WARNING_AMBER,
-                    f"{len(plan.not_in_portal)} students in Excel aren't in this portal table (skipped): "
-                    f"{_preview(plan.not_in_portal)}",
-                    WARN,
-                )
-            )
+            warnings.append(f"{len(plan.not_in_portal)} students in Excel aren't in the portal table")
+            details.append(f"In Excel but not in the portal (skipped): {_preview(plan.not_in_portal, 30)}")
         if plan.missing_from_excel:
-            summary.append(
-                self._fact(
-                    ft.Icons.WARNING_AMBER,
-                    f"{len(plan.missing_from_excel)} students in the portal have no row in Excel (left unchanged): "
-                    f"{_preview(plan.missing_from_excel)}",
-                    WARN,
-                )
-            )
+            warnings.append(f"{len(plan.missing_from_excel)} portal students aren't in Excel")
+            details.append(f"In the portal but not in Excel (left as they are): {_preview(plan.missing_from_excel, 30)}")
         if plan.duplicate_ids:
-            summary.append(
-                self._fact(
-                    ft.Icons.WARNING_AMBER,
-                    f"These IDs appear more than once in Excel, so they're skipped: {_preview(plan.duplicate_ids)}",
-                    WARN,
-                )
-            )
+            warnings.append(f"{len(plan.duplicate_ids)} IDs appear twice in Excel")
+            details.append(f"Appear more than once in Excel (skipped): {_preview(plan.duplicate_ids, 30)}")
         if plan.invalid_cells:
-            summary.append(
-                self._fact(
-                    ft.Icons.WARNING_AMBER,
-                    f"{len(plan.invalid_cells)} cells aren't numbers and are skipped: {_preview(plan.invalid_cells, 3)}",
-                    WARN,
-                )
-            )
+            warnings.append(f"{len(plan.invalid_cells)} cells aren't numbers")
+            details.append("Not numbers (skipped):\n" + "\n".join(f"  • {c}" for c in plan.invalid_cells[:30]))
+        if plan.blank_cells:
+            details.append(f"{plan.blank_cells} blank Excel cells will be left as they are.")
         if plan.rows_without_id:
-            summary.append(self._fact(ft.Icons.REMOVE, f"{plan.rows_without_id} Excel rows have no student ID (ignored)."))
+            details.append(f"{plan.rows_without_id} Excel rows have no student ID (ignored).")
+
+        if warnings:
+            summary.append(self._fact(ft.Icons.WARNING_AMBER, " · ".join(warnings) + ".", WARN))
+        if details:
+            details_box = ft.Column(
+                [ft.Text(d, size=12, selectable=True) for d in details], spacing=6, visible=False
+            )
+
+            def toggle_details(e):
+                details_box.visible = not details_box.visible
+                e.control.content = "Hide details" if details_box.visible else "Show details"
+                self.page.update()
+
+            summary += [ft.TextButton("Show details", on_click=toggle_details), details_box]
 
         preview_rows = plan.students[:5]
         preview = ft.DataTable(
@@ -1073,10 +1097,17 @@ class GradeFillerApp:
         )
 
     @staticmethod
-    def _fact(icon, text: str, color=INFO) -> ft.Control:
+    def _fact(icon, text: str, color=INFO, action: Optional[ft.Control] = None) -> ft.Control:
+        if action is None:
+            # Long text must wrap inside the row, so let it take the remaining width.
+            return ft.Row(
+                [ft.Icon(icon, color=color, size=18), ft.Text(text, expand=True, selectable=True)],
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            )
         return ft.Row(
-            [ft.Icon(icon, color=color, size=18), ft.Text(text, expand=True, selectable=True)],
-            vertical_alignment=ft.CrossAxisAlignment.START,
+            [ft.Icon(icon, color=color, size=18), ft.Text(text, selectable=True), action],
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            wrap=True,
         )
 
     def _show_message(self, title: str, message: str):

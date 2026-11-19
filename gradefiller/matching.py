@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Optional
 
 import pandas as pd
 
-from gradefiller.automation import GridColumn, looks_numeric, normalize_id
+from gradefiller.automation import GridColumn, GridInfo, looks_numeric, normalize_id, scan_grid
 
 # IDs are long digit strings; this keeps small grade values (e.g. "10")
 # from being mistaken for matching IDs.
@@ -41,6 +42,54 @@ def detect_id_columns(
             if n > best[2]:
                 best = (g.index, col, n)
     return best
+
+
+@dataclass
+class GridMatch:
+    """How well one browser table fits the chosen Excel sheet."""
+    grid: GridInfo
+    shared_ids: int       # students in both this table and the sheet
+    table_students: int   # student IDs found in the table
+    sheet_students: int   # student IDs in the sheet's matching column
+
+    def sort_key(self):
+        # Most shared students wins; then the closest student count; then
+        # the browser's own "in front" ranking.
+        return (self.shared_ids, -abs(self.table_students - self.sheet_students), self.grid.priority())
+
+
+def rank_grids(grids: list[GridInfo], df: pd.DataFrame) -> tuple[list[GridMatch], bool]:
+    """Order browser tables by how well they match the sheet's students.
+
+    Compares all IDs rather than just the first row, because the portal and
+    the sheet are often sorted differently. Returns (ranked, confident):
+    confident means the best table clearly holds this sheet's students, so
+    the UI can pick it without asking.
+    """
+    excel_sets = {c: _id_set(df[c]) for c in df.columns}
+    matches = []
+    for g in grids:
+        columns = scan_grid(g).columns
+        best_shared, best_table, best_sheet = 0, 0, 0
+        for col in columns:
+            portal = _id_set(col.values)
+            if not portal:
+                continue
+            for ex in excel_sets.values():
+                n = len(portal & ex)
+                if n > best_shared:
+                    best_shared, best_table, best_sheet = n, len(portal), len(ex)
+        matches.append(GridMatch(g, best_shared, best_table, best_sheet))
+
+    matches.sort(key=GridMatch.sort_key, reverse=True)
+    if not matches or matches[0].shared_ids == 0:
+        return matches, False
+    top = matches[0]
+    # Most of the smaller side must match, and no other table may come close.
+    enough = top.shared_ids >= 0.5 * min(top.table_students, top.sheet_students)
+    runner_up = matches[1].shared_ids if len(matches) > 1 else 0
+    clear_winner = runner_up < 0.5 * top.shared_ids
+    return matches, enough and clear_winner
 
 
 def id_overlap(grid_column: GridColumn, df: pd.DataFrame, excel_column: str) -> tuple[int, int]:

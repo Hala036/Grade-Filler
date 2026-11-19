@@ -12,7 +12,7 @@
 > comes with every download. (The user lost an earlier set of notes once.) Commit
 > your updates to it along with your code changes.
 
-**Last updated:** 2026-11-19 · **Branch:** `improving-UI` (code pushed; these notes committed, not yet pushed) · **`main`:** old version, not merged yet
+**Last updated:** 2026-11-19 · **Branch:** `improving-UI` (latest commits not yet pushed) · **`main`:** old version, not merged yet
 
 ## What this is
 
@@ -57,6 +57,8 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 
 ## Recent fixes (newest first)
 
+- "Pick the grade table automatically…": **Auto-select the right table + quieter screens.** `matching.rank_grids` scores every browser table by how many of its student IDs are in the chosen sheet (all IDs, not just the first row, since the portal and sheet sort differently), then by closeness of student count, then by "in front". The picker only opens when it isn't clear (no shared IDs, or a second table comes within 50%); otherwise Match Columns shows one line, "Filling the portal table with N students", with a "Wrong table?" link. The Student ID pairing collapses to "N of M students found" with "Change". Review shows one main line plus a one-line warning summary; ID lists, blanks and rows without an ID sit behind "Show details". Shorter texts throughout Match Columns.
+
 - `7bc480c`: Copy grades as Excel shows them (they used to be rounded half-up to whole numbers).
 - `91fcf04`: **Popup grade table.** The portal lists groups in one grid and opens the real grade table in a popup. The old scan mixed all grids on the page and read the group list. Now every grid (all tabs and iframes) is discovered and tagged with `data-gradefiller-grid`; the visible one in front wins; Match Columns has a "Table to fill" picker when there are several. The edit focus click moved from page centre to the row's ID cell.
 - `85f61ab`: `requirements.txt` pins only direct deps (old `numpy==2.0.2` had no Python 3.13+ wheels, so the Windows install failed).
@@ -64,7 +66,7 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 
 ## Open issues / unverified (check on the REAL portal)
 
-- [ ] **Popup detection** was tested only on fake pages (same-DOM modal, iframe, new window). Confirm on the real portal; if it's wrong, inspect the popup's DOM and adjust `_DISCOVER_JS` / `GridInfo.priority`.
+- [x] **Popup detection: confirmed on the real portal** (user, 2026-11-19). All tables are found, including the popup's grade table. The "in front" ranking alone didn't settle the choice, so the user had to pick by hand; data-based auto-selection (above) now does it. Still to confirm on the real portal: that it picks the popup without asking.
 - [ ] **Edit focus click on the ID cell** (replaced the old `body.click()`). Confirm edits still commit, and that clicking a row does nothing unwanted.
 - [ ] **Decimals:** does the portal accept `36.8` / `25.0`? If it only takes integers, those cells show as "couldn't be set".
 - [ ] **Header labels:** confirm portal column names are read. Otherwise the UI falls back to "Column N" with example values.
