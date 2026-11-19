@@ -12,7 +12,7 @@
 > comes with every download. (The user lost an earlier set of notes once.) Commit
 > your updates to it along with your code changes.
 
-**Last updated:** 2026-11-19 · **Branch:** `improving-UI` (latest commits not yet pushed) · **`main`:** old version, not merged yet
+**Last updated:** 2026-11-20 · **`main`:** current, working version (`improving-UI` merged after a successful real run) · **Work happens on one branch per feature**, merged into `main` by pull request
 
 ## What this is
 
@@ -45,7 +45,7 @@ python -m venv .venv
 .venv\Scripts\python main.py
 ```
 On Windows, skip `activate` (script execution policy errors). Call `.venv\Scripts\python` directly.
-New computer without git: download https://github.com/Hala036/Grade-Filler/archive/refs/heads/improving-UI.zip
+New computer without git: download https://github.com/Hala036/Grade-Filler/archive/refs/heads/main.zip
 
 ## Decisions the user made (don't undo without asking)
 
@@ -83,7 +83,7 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 - [x] **Decimals:** the portal accepts values like `36.8` (user, 2026-11-19).
 - [x] **Edit focus click on the ID cell: confirmed on the real portal** (user, 2026-11-20). Grades are filled correctly and stay in their cells; each value is committed with Tab.
 - [x] **Header labels: confirmed on the real portal** (user, 2026-11-20). The popup's two-row header (`Mark` spans First 25 / Second 25 / Third 10) is laid out honouring rowspan/colspan in `_DISCOVER_JS`; each column takes its lowest name.
-- [ ] Merge `improving-UI` → `main` only after a successful real run.
+- [x] Merged `improving-UI` → `main` after a successful real run (2026-11-20).
 - [ ] No automated tests in the repo yet. Earlier checks were throwaway scripts: fake DHTMLX pages + headless Chromium, and a stub Flet page driving each step. Worth adding under `tests/`.
 - [x] Fixed: the `#` row-number column (values 1, 2, 3 …) and unnamed empty spacer columns are no longer offered as fill targets; name matching uses the max mark as a tie-breaker (`First 25` → `First/25`, not `First/30`) (`matching._split_label`, `_similarity`, `portal_fillable_columns`).
 
