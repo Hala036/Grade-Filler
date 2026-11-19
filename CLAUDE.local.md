@@ -30,6 +30,7 @@ double-click `.exe` with no terminal at all.
 | File | Role |
 |---|---|
 | `main.py` | Launcher: `python main.py`; `--self-test` checks a build without opening the app |
+| `assets/icon.png`, `assets/icon.ico` | App icon (user's red circled "A+"). `.ico` holds 16–256 px; 16–48 px have thickened strokes so they stay readable. Used for the `.exe` (`--icon`) and the window (`page.window.icon`, Windows only), bundled via `--add-data` and found with `paths.resource_path` |
 | `gradefiller/selftest.py` | Self-test: imports, Playwright driver, headless Edge/Chrome; writes `selftest.txt`, exit 0 = pass |
 | `.github/workflows/build-windows.yml` | Builds `GradeFiller.exe` on GitHub (Windows): manual run → Artifacts; tag `v*` → Release |
 | `gradefiller/app.py` | Flet wizard, 5 steps: Log In → Grades File → Course Table → Match Columns → Review & Fill |
@@ -58,6 +59,8 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 - **Optional round-up (off by default)** is the one exception to "no rounding". It goes by the first digit after the point, chosen per digit. The teacher's usual rule: .1–.4 up to .5, .5–.9 up to the next whole number (12.2 → 12.5, 12.5 → 13, 12 stays 12). Rounding must never lower a grade.
 
 ## Recent fixes (newest first)
+
+- **App icon** (branch `windows-exe`): the user's A+ image, cropped and turned into `assets/icon.ico`; set on the `.exe` and the app window; the self-test fails if it isn't bundled.
 
 - **GitHub build for the `.exe`** (branch `windows-exe`). `build-windows.yml` on `windows-latest`, Python 3.12: installs `requirements.txt` + `pyinstaller`, `flet pack main.py --name GradeFiller` (single file, no console), then runs `GradeFiller.exe --self-test` and fails unless Edge started from inside the bundle. Manual "Run workflow" (once on `main`) or any PR into `main` → download from the run's Artifacts; pushing tag `vX.Y.Z` also creates a Release, so the newest is always at `releases/latest/download/GradeFiller.exe`.
 

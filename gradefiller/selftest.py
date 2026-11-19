@@ -20,6 +20,12 @@ def run(report: Path = Path("selftest.txt")) -> int:
         from gradefiller.automation import PortalSession
 
         lines.append("imports: ok")
+        from gradefiller.paths import resource_path
+
+        icon = resource_path("assets/icon.ico")
+        lines.append(f"window icon: {'ok' if icon.exists() else 'MISSING'} ({icon})")
+        if not icon.exists():
+            raise FileNotFoundError(icon)
         with sync_playwright() as p:
             lines.append("playwright driver: ok")
             for channel in PortalSession.BROWSER_CHANNELS:

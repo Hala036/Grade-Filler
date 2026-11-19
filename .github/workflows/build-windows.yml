@@ -45,6 +45,8 @@ jobs:
         run: >
           flet pack main.py -y
           --name GradeFiller
+          --icon assets/icon.ico
+          --add-data "assets/icon.ico:assets"
           --product-name "Grade Filler"
           --file-description "Grade Filler"
           --product-version "${{ steps.version.outputs.number }}"
