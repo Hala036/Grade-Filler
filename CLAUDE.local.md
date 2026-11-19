@@ -1,0 +1,96 @@
+# Grade Filler: where we left off
+
+> **For every agent working in this repo:** read this file before changing
+> anything, and **keep it updated** before you finish a task. Do this in the same
+> session as the work:
+> - move items from "Open issues" / "Next features" to "Recent fixes" when done
+> - add any new bug, limitation or user decision you discover
+> - update "Last updated" and the branch/push status
+> - keep entries short: what, why, where (file/function), commit hash if any
+>
+> This file is committed to the repo on purpose, so it's backed up on GitHub and
+> comes with every download. (The user lost an earlier set of notes once.) Commit
+> your updates to it along with your code changes.
+
+**Last updated:** 2026-11-20 · **`main`:** current, working version (`improving-UI` merged after a successful real run) · **Work happens on one branch per feature**, merged into `main` by pull request
+
+## What this is
+
+A desktop app (Python + Flet UI + Playwright) that types grades from a teacher's
+Excel sheet into the Al-Quds University grades portal
+(`portal.alquds.edu`, a DHTMLX grid). Nothing is saved automatically. The
+teacher reviews and clicks the portal's own Save button.
+
+**The real user** runs it on a **Windows laptop and isn't technical**: no git,
+terminals are a struggle. Every UI text must be plain language. The end goal is a
+double-click `.exe` with no terminal at all.
+
+## Layout
+
+| File | Role |
+|---|---|
+| `main.py` | Launcher: `python main.py` |
+| `gradefiller/app.py` | Flet wizard, 5 steps: Log In → Grades File → Course Table → Match Columns → Review & Fill |
+| `gradefiller/automation.py` | All browser + Excel work: `PortalSession`, grid discovery (`find_grids`, `GridInfo`), `scan_grid`, `load_sheet` / `excel_display_text`, `build_fill_plan`, `run_fill`, `edit_cell_commit` |
+| `gradefiller/matching.py` | Pure auto-matching: ID pair by shared values, grade pairs by name similarity |
+| `gradefiller/playwright_worker.py` | One thread owns Playwright (sync API is thread-bound); UI submits tasks |
+| `gradefiller/paths.py` | Saved login → `%APPDATA%\GradeFiller\state.json` / `~/Library/Application Support/GradeFiller` |
+
+## Run it
+
+```
+python -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt     # macOS: .venv/bin/python
+.venv\Scripts\python -m playwright install chromium
+.venv\Scripts\python main.py
+```
+On Windows, skip `activate` (script execution policy errors). Call `.venv\Scripts\python` directly.
+New computer without git: download https://github.com/Hala036/Grade-Filler/archive/refs/heads/main.zip
+
+## Decisions the user made (don't undo without asking)
+
+- **Works for any course / any number of exams.** Nothing hardcoded; columns are read from the live grid and mapped in the UI.
+- **Grades are copied exactly as Excel displays them** (number formats applied: format `0` showing 14 types 14, General 12.5 types 12.5, float noise removed). No rounding beyond what Excel shows. (`excel_display_text`)
+- **Blank Excel cells leave the portal cell unchanged** by default. A checkbox writes 0 instead. (I chose this; the user didn't object.)
+- **Duplicate IDs in Excel are skipped**, never guessed. Non-numeric cells are skipped and reported.
+- **Optional round-up (off by default)** is the one exception to "no rounding". It goes by the first digit after the point, chosen per digit. The teacher's usual rule: .1–.4 up to .5, .5–.9 up to the next whole number (12.2 → 12.5, 12.5 → 13, 12 stays 12). Rounding must never lower a grade.
+
+## Recent fixes (newest first)
+
+- **Empty dropdowns look unfinished.** Every dropdown goes through `app._picker` / `_style_picker`: when nothing is chosen the label is faded (55% blue-grey), italic, with a light border; once chosen, label and border go dark and the value is semi-bold. Asked by the user because set and unset selectors looked alike.
+
+- **Quieter column dropdowns.** Example values in brackets ("(now: 14)", "(e.g. 12)") now appear only for columns without a real name (portal "Column N", Excel "Unnamed: N"); named columns show just the name (user found it overwhelming once names were read). The Review step's 5-student preview is the sanity check. `matching.is_generic_label`.
+
+- Deleted the obsolete `gui.py`, `upload_grades.py`, `save_session.py` (user agreed, 2026-11-19).
+
+- "Show screen changes from the browser thread right away": **The screen froze on "Looking for the grade table…" until the window lost focus.** Cause: worker callbacks updated Flet from the Playwright thread; Flet's desktop transport queues outgoing changes in an `asyncio.Queue` (`flet_socket_server.send_message` → `put_nowait`), which doesn't wake the event loop when touched from another thread, so the new screen waited for any other event (focus change) to wake it. Fix: `PlaywrightWorker(dispatch=…)` hands every `on_success`/`on_error` to `GradeFillerApp._on_ui_thread`, which runs it via `page.run_task` on Flet's loop. Fill progress (`on_progress`, called on the browser thread) goes through the same path. **Rule for agents: never update Flet controls from the worker thread or any other thread; use `_on_ui_thread`.**
+
+- **Round-up option in Match Columns: two joined arrows on a 0–1 line** (user's design, 2026-11-20). A "Round grades up" checkbox opens a number line (0, 0.1 … 1) with an amber arrow (start → joint) and a green arrow (joint → end); grades under an arrow go up to where it points. Default (0.1, 0.5, 1): .1–.4 → .5, .5–.9 → next whole. The three dots snap to tenths and can be dragged or clicked to; they push each other and never cross. Dragging the joint to 1 makes the green arrow disappear; dragging it back brings it back (no extra buttons, user's choice). Ends other than .5/1 are allowed (e.g. 0.3 → 0.6, 0.6 → 0.9) because the teacher "might" need them. A sentence underneath and on Review spells it out ("below 0.2 stays · 0.2–0.49 → 0.5 · 0.5–0.99 → 1"); examples use 0–1, not 12 (user's request). Each changed cell is listed under "Show details". Code: `gradefiller/round_line.py` (`RoundLine`, a Flet canvas + GestureDetector), `automation.RoundUp(start, joint, end)` in tenths + `apply_round_up`, applied in `build_fill_plan` (`FillPlan.rounded`). Only the **first** decimal digit counts (12.05 behaves like 12.0). Applied to the text Excel *displays*. Replaced two earlier versions (number boxes, then one clickable box per digit). Drawing checked with a Flet screenshot; dragging only checked in code, not by hand yet.
+
+- "Choose the Mark Entry popup's table…": **The "Mark Entry" popup decides the table.** User fact: the portal's popup is always titled "Mark Entry" and holds only the table the teacher opened on purpose. Each discovered grid gets `titled=True` when it sits inside a *floating* box (CSS `position` absolute/fixed) whose text includes `POPUP_TITLE`, or is the only grid in a window titled that way, or sits in an iframe under such a box (`_frame_is_titled`). The floating requirement stops a page menu link saying "Mark Entry" from marking the table behind the popup. Exactly one titled table is chosen with no picker; otherwise the ID ranking below is the fallback. The ID count stays as a warning only: under 50% matched means "Only X of Y students are in your sheet. Is it the right sheet for this group?" (wrong section).
+- "Pick the grade table automatically…": **Auto-select the right table + quieter screens.** `matching.rank_grids` scores every browser table by how many of its student IDs are in the chosen sheet (all IDs, not just the first row, since the portal and sheet sort differently), then by closeness of student count, then by "in front". The picker only opens when it isn't clear (no shared IDs, or a second table comes within 50%); otherwise Match Columns shows one line, "Filling the portal table with N students", with a "Wrong table?" link. The Student ID pairing collapses to "N of M students found" with "Change". Review shows one main line plus a one-line warning summary; ID lists, blanks and rows without an ID sit behind "Show details". Shorter texts throughout Match Columns.
+
+- `7bc480c`: Copy grades as Excel shows them (they used to be rounded half-up to whole numbers).
+- `91fcf04`: **Popup grade table.** The portal lists groups in one grid and opens the real grade table in a popup. The old scan mixed all grids on the page and read the group list. Now every grid (all tabs and iframes) is discovered and tagged with `data-gradefiller-grid`; the visible one in front wins; Match Columns has a "Table to fill" picker when there are several. The edit focus click moved from page centre to the row's ID cell.
+- `85f61ab`: `requirements.txt` pins only direct deps (old `numpy==2.0.2` had no Python 3.13+ wheels, so the Windows install failed).
+- `648351b`: Wizard rework. Flet 0.86 fixes (async `FilePicker.pick_files`, `Dropdown.on_select`, button `content`); one reused browser instead of two; retry/Back everywhere; worker survives callback errors; auto-matching; example values in dropdowns; validation; review step with preview; per-cell failures don't abort; end-of-run summary.
+
+## Open issues / unverified (check on the REAL portal)
+
+- [x] **"Looking for the grade table…" is slow on the real portal** (user, 2026-11-19). **Resolved:** the search itself was fast (the user confirmed with the timing log); the screen just didn't redraw until the window lost focus. See the thread fix in Recent fixes. Original notes: It's not the ID comparison: on a portal-sized fake page (110 students × 20 columns, 4 frames) the search takes ~30 ms, ranking ~2 ms and building the screen ~20 ms. Timing logs were added to find out (since then they go only to the file, not the terminal, at the user's request; size-capped at ~1 MB): `GradeFiller/gradefiller.log` (in `%APPDATA%` on Windows, `~/Library/Application Support` on macOS) show the wait for the browser worker, ms per tab/frame (with URL; `[Mark Entry]` marks the popup), `save_session` time, and how the table was chosen ("by the 'Mark Entry' popup title" vs "by student IDs"). Next: read a real log. Suspects: a slow or still-loading frame (`frame.evaluate` has no timeout), slow `innerText` on a big portal page in `gfTitled`, or the worker still busy with an earlier browser action.
+
+- [x] **Popup detection + Mark Entry auto-pick: confirmed on the real portal** (user, 2026-11-19). The Mark Entry table is chosen without asking.
+- [x] **Decimals:** the portal accepts values like `36.8` (user, 2026-11-19).
+- [x] **Edit focus click on the ID cell: confirmed on the real portal** (user, 2026-11-20). Grades are filled correctly and stay in their cells; each value is committed with Tab.
+- [x] **Header labels: confirmed on the real portal** (user, 2026-11-20). The popup's two-row header (`Mark` spans First 25 / Second 25 / Third 10) is laid out honouring rowspan/colspan in `_DISCOVER_JS`; each column takes its lowest name.
+- [x] Merged `improving-UI` → `main` after a successful real run (2026-11-20).
+- [ ] No automated tests in the repo yet. Earlier checks were throwaway scripts: fake DHTMLX pages + headless Chromium, and a stub Flet page driving each step. Worth adding under `tests/`.
+- [x] Fixed: the `#` row-number column (values 1, 2, 3 …) and unnamed empty spacer columns are no longer offered as fill targets; name matching uses the max mark as a tie-breaker (`First 25` → `First/25`, not `First/30`) (`matching._split_label`, `_similarity`, `portal_fillable_columns`).
+
+## Next features
+
+1. **Windows `.exe`, no terminal (top priority).** Plan: GitHub Actions on `windows-latest` builds a single file (`flet pack`, which wraps PyInstaller) from `main.py`, uploaded as a build artifact/release. Saved login already lives in `%APPDATA%`. Expect a SmartScreen "More info → Run anyway" on first launch (unsigned). Needs the user's go-ahead before pushing a workflow.
+   - **Don't bundle Chromium; use the installed Edge.** Today the app drives Playwright's own downloaded Chromium (`playwright install chromium`, ~150 MB in a user cache folder). Packing that into the `.exe` makes it huge, and Playwright's browser-path lookup breaks inside PyInstaller's temp extraction. Instead launch with `chromium.launch(channel="msedge")` (Edge ships with every Windows install), falling back to `channel="chrome"`, then to the downloaded Chromium for dev machines. Change is in `PortalSession._ensure_browser`. Small risk: a future auto-updated Edge could outrun the pinned Playwright, in which case bump `playwright` in `requirements.txt` and rebuild.
+2. Whatever the user asks for next. Add it here.
+   - Possible: remember the round-up setting between runs (today it resets each launch).
+   - The local sample sheet `2251-1214311-sec1-Grades.xlsx` (gitignored) was removed from the folder on 2026-11-20; tests since then use made-up data.
