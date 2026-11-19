@@ -59,7 +59,7 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 
 ## Recent fixes (newest first)
 
-- **GitHub build for the `.exe`** (branch `windows-exe`). `build-windows.yml` on `windows-latest`, Python 3.12: installs `requirements.txt` + `pyinstaller`, `flet pack main.py --name GradeFiller` (single file, no console), then runs `GradeFiller.exe --self-test` and fails unless Edge started from inside the bundle. Manual "Run workflow" → download from the run's Artifacts; pushing tag `vX.Y.Z` also creates a Release, so the newest is always at `releases/latest/download/GradeFiller.exe`.
+- **GitHub build for the `.exe`** (branch `windows-exe`). `build-windows.yml` on `windows-latest`, Python 3.12: installs `requirements.txt` + `pyinstaller`, `flet pack main.py --name GradeFiller` (single file, no console), then runs `GradeFiller.exe --self-test` and fails unless Edge started from inside the bundle. Manual "Run workflow" (once on `main`) or any PR into `main` → download from the run's Artifacts; pushing tag `vX.Y.Z` also creates a Release, so the newest is always at `releases/latest/download/GradeFiller.exe`.
 
 - **Uses the installed browser** (branch `windows-exe`). `PortalSession._launch_browser` tries `BROWSER_CHANNELS = ("msedge", "chrome", None)`: Edge (always on Windows), then Chrome (the user's Mac), then Playwright's downloaded Chromium. None found → "Couldn't open a web browser. Please install Microsoft Edge or Google Chrome and try again." Tested on the Mac (Edge missing → Chrome 157). Not yet tested with Edge on Windows. Each run is a clean browser profile; the login lives in the app's `state.json`.
 
