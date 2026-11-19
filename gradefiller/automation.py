@@ -217,13 +217,17 @@ class PortalSession:
                     continue
                 for fi, f in enumerate(p.frames):
                     try:
-                        found = f.evaluate(_DISCOVER_JS, [ROW_LOCATOR, GRID_ATTR, f"p{pi}f{fi}g"])
+                        found = f.evaluate(_DISCOVER_JS, [ROW_LOCATOR, GRID_ATTR, f"p{pi}f{fi}g", POPUP_TITLE])
                     except PwError:
                         continue  # frame navigated/detached mid-scan
+                    in_frame = f != p.main_frame
+                    if in_frame and found and not any(d["titled"] for d in found):
+                        # The popup's title may sit outside the frame, above it.
+                        framed_title = _frame_is_titled(f)
+                        if framed_title and len(found) == 1:
+                            found[0]["titled"] = True
                     for d in found:
-                        grids.append(
-                            GridInfo(page=p, frame=f, page_index=pi, in_frame=f != p.main_frame, **d)
-                        )
+                        grids.append(GridInfo(page=p, frame=f, page_index=pi, in_frame=in_frame, **d))
             if grids or time.monotonic() >= deadline:
                 grids.sort(key=GridInfo.priority, reverse=True)
                 return grids
@@ -261,8 +265,34 @@ class PortalSession:
 #     div.objbox > table.obj > tr.ev_dhx_web/.odd_dhx_web > td
 GRID_ATTR = "data-gradefiller-grid"
 
-_DISCOVER_JS = r"""
-([rowSel, attr, prefix]) => {
+# The portal opens the table to fill in a popup with this title. A table
+# under it is chosen without asking (lower-case; matched as a substring).
+POPUP_TITLE = "mark entry"
+
+
+_TITLE_HELPER_JS = r"""
+function gfTitled(start, attr, needle) {
+  // True if `start` sits inside a floating popup (absolutely/fixed positioned
+  // box) whose text includes the title. Requiring the popup box keeps a page
+  // menu link with the same words from marking the table behind the popup.
+  const norm = s => (s || '').toLowerCase().replace(/\s+/g, ' ');
+  const floating = el => ['absolute', 'fixed'].includes(getComputedStyle(el).position);
+  let inPopup = floating(start);
+  for (let e = start.parentElement; e && e !== document.documentElement; e = e.parentElement) {
+    // Stop before a level that also holds another table: its title isn't ours.
+    const others = Array.from(e.querySelectorAll('[' + attr + ']'))
+      .some(o => o !== start && !start.contains(o) && !o.contains(start));
+    if (others) return false;
+    inPopup = inPopup || floating(e);
+    if (inPopup && norm(e.innerText).includes(needle)) return true;
+  }
+  return false;
+}
+"""
+
+_DISCOVER_JS = "(" + r"""
+([rowSel, attr, prefix, needle]) => {
+  """ + _TITLE_HELPER_JS + r"""
   document.querySelectorAll('[' + attr + ']').forEach(e => e.removeAttribute(attr));
   const groups = new Map();
   for (const r of document.querySelectorAll(rowSel)) {
@@ -273,7 +303,8 @@ _DISCOVER_JS = r"""
   }
   const tables = Array.from(groups.keys());
   const text = el => (el.innerText || '').trim();
-  return tables.map((t, i) => {
+  const containers = [];
+  const out = tables.map((t, i) => {
     // Climb to the grid's container, but never so far that it holds another grid.
     let c = t;
     for (let k = 0; k < 8 && c.parentElement && c.parentElement !== document.body; k++) {
@@ -284,6 +315,7 @@ _DISCOVER_JS = r"""
     }
     const key = prefix + i;
     c.setAttribute(attr, key);
+    containers.push(c);
 
     const rows = groups.get(t);
     const matrix = rows.map(r => Array.from(r.cells).map(text));
@@ -316,8 +348,14 @@ _DISCOVER_JS = r"""
     }
     return {key, rows: rows.length, cols, labels, visible, on_top: onTop, z, order: i, matrix};
   });
+  // Only now are all tables tagged, so a title can't be credited to the wrong one.
+  const docTitle = (document.title || '').toLowerCase();
+  out.forEach((o, i) => {
+    o.titled = gfTitled(containers[i], attr, needle) || (out.length === 1 && docTitle.includes(needle));
+  });
+  return out;
 }
-"""
+""" + ")"
 
 
 @dataclass
@@ -335,12 +373,13 @@ class GridInfo:
     on_top: bool
     z: int
     order: int
+    titled: bool = False  # sits in the portal's "Mark Entry" popup
     matrix: list[list[str]] = field(repr=False, default_factory=list)
 
     def priority(self):
-        # Visible and in front first; then newer windows, embedded frames,
-        # higher stacking (popups), and finally later in the page.
-        return (self.visible, self.on_top, self.page_index, self.in_frame, self.z, self.order)
+        # The "Mark Entry" popup first; then visible and in front, newer
+        # windows, embedded frames, higher stacking, later in the page.
+        return (self.titled, self.visible, self.on_top, self.page_index, self.in_frame, self.z, self.order)
 
     def root(self):
         return self.frame.locator(f'[{GRID_ATTR}="{self.key}"]')
@@ -356,6 +395,18 @@ class GridInfo:
             cols = "e.g. " + ", ".join(v for v in first if v)[:60]
         front = " — in front" if self.on_top else ""
         return f"{self.rows} rows: {cols}{front}"
+
+
+def _frame_is_titled(frame: Frame) -> bool:
+    """Whether the <iframe> holding this frame sits under the popup title."""
+    try:
+        element = frame.frame_element()
+        return bool(element.evaluate(
+            "(el, [attr, needle]) => {" + _TITLE_HELPER_JS + " return gfTitled(el, attr, needle); }",
+            [GRID_ATTR, POPUP_TITLE],
+        ))
+    except PwError:
+        return False
 
 
 _READ_ROWS_JS = "rows => rows.map(r => Array.from(r.cells).map(c => (c.innerText || '').trim()))"

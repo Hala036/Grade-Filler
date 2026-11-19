@@ -492,6 +492,11 @@ class GradeFillerApp:
                 )
                 return
             ranked, confident = matching.rank_grids(grids, self.df)
+            titled = [m for m in ranked if m.grid.titled]
+            if len(titled) == 1:
+                # The "Mark Entry" popup is the table the user opened on purpose.
+                ranked = titled + [m for m in ranked if m is not titled[0]]
+                confident = True
             self.grid_choices = [m.grid for m in ranked]
             self.table_match = ranked[0]
             # Ask only when there's a real choice and the data didn't settle it.
@@ -626,6 +631,8 @@ class GradeFillerApp:
             if self.id_portal is not None and self.id_excel is not None:
                 found, total = matching.id_overlap(self._grid_col(self.id_portal), self.df, self.id_excel)
             id_ok = found > 0
+            # Few matches usually means the sheet is for another section/group.
+            few = id_ok and found < 0.5 * total
 
             def toggle_id_editor(_):
                 self._show_id_editor = not self._show_id_editor
@@ -634,9 +641,10 @@ class GradeFillerApp:
             if id_ok and not self._show_id_editor:
                 # Matched automatically: one line instead of two dropdowns.
                 id_section = self._fact(
-                    ft.Icons.CHECK_CIRCLE,
-                    f"{found} of {total} students found in your sheet.",
-                    OK,
+                    ft.Icons.WARNING_AMBER if few else ft.Icons.CHECK_CIRCLE,
+                    f"Only {found} of {total} students are in your sheet. Is it the right sheet for this group?"
+                    if few else f"{found} of {total} students found in your sheet.",
+                    WARN if few else OK,
                     action=ft.TextButton("Change", on_click=toggle_id_editor),
                 )
             else:
@@ -789,7 +797,8 @@ class GradeFillerApp:
                 notices.append(
                     self._fact(
                         ft.Icons.TABLE_CHART,
-                        f"Filling the portal table with {current.rows} students.",
+                        f"Filling the Mark Entry table ({current.rows} students)." if current.titled
+                        else f"Filling the portal table with {current.rows} students.",
                         INFO,
                         action=ft.TextButton("Wrong table?", on_click=toggle_table_picker)
                         if len(self.grid_choices) > 1 else None,
