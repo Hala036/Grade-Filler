@@ -41,7 +41,7 @@ double-click `.exe` with no terminal at all.
 ```
 python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt     # macOS: .venv/bin/python
-.venv\Scripts\python -m playwright install chromium
+.venv\Scripts\python -m playwright install chromium   # optional: only if neither Edge nor Chrome is installed
 .venv\Scripts\python main.py
 ```
 On Windows, skip `activate` (script execution policy errors). Call `.venv\Scripts\python` directly.
@@ -56,6 +56,8 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 - **Optional round-up (off by default)** is the one exception to "no rounding". It goes by the first digit after the point, chosen per digit. The teacher's usual rule: .1–.4 up to .5, .5–.9 up to the next whole number (12.2 → 12.5, 12.5 → 13, 12 stays 12). Rounding must never lower a grade.
 
 ## Recent fixes (newest first)
+
+- **Uses the installed browser** (branch `windows-exe`). `PortalSession._launch_browser` tries `BROWSER_CHANNELS = ("msedge", "chrome", None)`: Edge (always on Windows), then Chrome (the user's Mac), then Playwright's downloaded Chromium. None found → "Couldn't open a web browser. Please install Microsoft Edge or Google Chrome and try again." Tested on the Mac (Edge missing → Chrome 157). Not yet tested with Edge on Windows. Each run is a clean browser profile; the login lives in the app's `state.json`.
 
 - **Empty dropdowns look unfinished.** Every dropdown goes through `app._picker` / `_style_picker`: when nothing is chosen the label is faded (55% blue-grey), italic, with a light border; once chosen, label and border go dark and the value is semi-bold. Asked by the user because set and unset selectors looked alike.
 
@@ -89,8 +91,8 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 
 ## Next features
 
-1. **Windows `.exe`, no terminal (top priority).** Plan: GitHub Actions on `windows-latest` builds a single file (`flet pack`, which wraps PyInstaller) from `main.py`, uploaded as a build artifact/release. Saved login already lives in `%APPDATA%`. Expect a SmartScreen "More info → Run anyway" on first launch (unsigned). Needs the user's go-ahead before pushing a workflow.
-   - **Don't bundle Chromium; use the installed Edge.** Today the app drives Playwright's own downloaded Chromium (`playwright install chromium`, ~150 MB in a user cache folder). Packing that into the `.exe` makes it huge, and Playwright's browser-path lookup breaks inside PyInstaller's temp extraction. Instead launch with `chromium.launch(channel="msedge")` (Edge ships with every Windows install), falling back to `channel="chrome"`, then to the downloaded Chromium for dev machines. Change is in `PortalSession._ensure_browser`. Small risk: a future auto-updated Edge could outrun the pinned Playwright, in which case bump `playwright` in `requirements.txt` and rebuild.
+1. **Windows `.exe`, no terminal (top priority).** Plan: GitHub Actions on `windows-latest` builds a single file (`flet pack`, which wraps PyInstaller) from `main.py`, uploaded as a build artifact/release. Saved login already lives in `%APPDATA%`. Expect a SmartScreen "More info → Run anyway" on first launch (unsigned). Needs the user's go-ahead before pushing a workflow. The `.exe` is never built by hand or committed: pushing a tag like `v1.0.0` builds it on GitHub and attaches it to a Release (user agreed, 2026-11-20).
+   - Done: the installed Edge/Chrome is used (see Recent fixes), so nothing browser-related is bundled. Small risk: a future auto-updated Edge could outrun the pinned Playwright, in which case bump `playwright` in `requirements.txt` and rebuild.
 2. Whatever the user asks for next. Add it here.
    - Possible: remember the round-up setting between runs (today it resets each launch).
    - The local sample sheet `2251-1214311-sec1-Grades.xlsx` (gitignored) was removed from the folder on 2026-11-20; tests since then use made-up data.

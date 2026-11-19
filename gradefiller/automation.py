@@ -232,6 +232,26 @@ class PortalSession:
         except PwError:
             return False
 
+    # Browsers to try, in order: the Edge every Windows laptop has, then
+    # Chrome, then Playwright's own Chromium (only on dev machines that ran
+    # "playwright install chromium"). Using an installed browser keeps the
+    # .exe small and needs no download on the teacher's laptop.
+    BROWSER_CHANNELS = ("msedge", "chrome", None)
+
+    def _launch_browser(self) -> Browser:
+        errors = []
+        for channel in self.BROWSER_CHANNELS:
+            try:
+                browser = self._playwright.chromium.launch(headless=False, channel=channel)
+                log.info("browser: %s", channel or "playwright chromium")
+                return browser
+            except PwError as e:
+                errors.append(f"{channel or 'chromium'}: {str(e).splitlines()[0][:120]}")
+        log.info("no browser could be started: %s", "; ".join(errors))
+        raise RuntimeError(
+            "Couldn't open a web browser. Please install Microsoft Edge or Google Chrome and try again."
+        )
+
     def _ensure_browser(self) -> None:
         if self._alive():
             if self.page is None or self.page.is_closed():
@@ -241,7 +261,7 @@ class PortalSession:
 
         self.close()
         self._playwright = sync_playwright().start()
-        self.browser = self._playwright.chromium.launch(headless=False)
+        self.browser = self._launch_browser()
         self.context = None
         if self.state_path.exists():
             try:
