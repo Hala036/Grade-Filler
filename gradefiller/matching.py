@@ -118,14 +118,14 @@ def grade_candidate_columns(df: pd.DataFrame, id_column: Optional[str]) -> list[
     return out
 
 
-def _is_generic(label: str) -> bool:
+def is_generic_label(label: str) -> bool:
     """True for the fallback names given to columns without a header ("Column 3")."""
     return label.startswith("Column ") and label[7:].isdigit()
 
 
 def portal_fillable_columns(grid: list[GridColumn], id_index: Optional[int]) -> list[GridColumn]:
     """Portal columns that could receive grades (not the ID, not text like names)."""
-    named = any(not _is_generic(g.label) for g in grid)
+    named = any(not is_generic_label(g.label) for g in grid)
     out = []
     for g in grid:
         if g.index == id_index:
@@ -135,7 +135,7 @@ def portal_fillable_columns(grid: list[GridColumn], id_index: Optional[int]) -> 
             continue  # names, statuses, etc.
         if len(non_blank) > 1 and non_blank == [str(n) for n in range(1, len(non_blank) + 1)]:
             continue  # the portal's row-number column ("#"): 1, 2, 3 …
-        if not non_blank and _is_generic(g.label) and named:
+        if not non_blank and is_generic_label(g.label) and named:
             continue  # unnamed and empty while others have names: a hidden spacer column
         out.append(g)
     return out
@@ -179,7 +179,7 @@ def suggest_grade_mappings(
     """One-to-one (portal_index, excel_column) pairs whose names clearly match."""
     scored = []
     for g in portal_columns:
-        if _is_generic(g.label):
+        if is_generic_label(g.label):
             continue  # generic label, nothing to compare
         for c in excel_columns:
             s = _similarity(g.label, c)

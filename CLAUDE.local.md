@@ -57,6 +57,8 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 
 ## Recent fixes (newest first)
 
+- **Quieter column dropdowns.** Example values in brackets ("(now: 14)", "(e.g. 12)") now appear only for columns without a real name (portal "Column N", Excel "Unnamed: N"); named columns show just the name (user found it overwhelming once names were read). The Review step's 5-student preview is the sanity check. `matching.is_generic_label`.
+
 - Deleted the obsolete `gui.py`, `upload_grades.py`, `save_session.py` (user agreed, 2026-11-19).
 
 - "Show screen changes from the browser thread right away": **The screen froze on "Looking for the grade table…" until the window lost focus.** Cause: worker callbacks updated Flet from the Playwright thread; Flet's desktop transport queues outgoing changes in an `asyncio.Queue` (`flet_socket_server.send_message` → `put_nowait`), which doesn't wake the event loop when touched from another thread, so the new screen waited for any other event (focus change) to wake it. Fix: `PlaywrightWorker(dispatch=…)` hands every `on_success`/`on_error` to `GradeFillerApp._on_ui_thread`, which runs it via `page.run_task` on Flet's loop. Fill progress (`on_progress`, called on the browser thread) goes through the same path. **Rule for agents: never update Flet controls from the worker thread or any other thread; use `_on_ui_thread`.**
@@ -78,7 +80,7 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 - [x] **Popup detection + Mark Entry auto-pick: confirmed on the real portal** (user, 2026-11-19). The Mark Entry table is chosen without asking.
 - [x] **Decimals:** the portal accepts values like `36.8` (user, 2026-11-19).
 - [x] **Edit focus click on the ID cell: confirmed on the real portal** (user, 2026-11-20). Grades are filled correctly and stay in their cells; each value is committed with Tab.
-- [ ] **Header labels: fixed, confirm on the real portal.** The popup's header has two rows with merged cells (`Mark` spans First 25 / Second 25 / Third 10; first `#` and last hidden column have no name), so no single row matched. Now `_DISCOVER_JS` lays the header out honouring rowspan/colspan and takes each column's lowest name. Tested in headless Chromium with the real header HTML the user pasted. Match Columns should no longer say names couldn't be read.
+- [x] **Header labels: confirmed on the real portal** (user, 2026-11-20). The popup's two-row header (`Mark` spans First 25 / Second 25 / Third 10) is laid out honouring rowspan/colspan in `_DISCOVER_JS`; each column takes its lowest name.
 - [ ] Merge `improving-UI` → `main` only after a successful real run.
 - [ ] No automated tests in the repo yet. Earlier checks were throwaway scripts: fake DHTMLX pages + headless Chromium, and a stub Flet page driving each step. Worth adding under `tests/`.
 - [x] Fixed: the `#` row-number column (values 1, 2, 3 …) and unnamed empty spacer columns are no longer offered as fill targets; name matching uses the max mark as a tie-breaker (`First 25` → `First/25`, not `First/30`) (`matching._split_label`, `_similarity`, `portal_fillable_columns`).

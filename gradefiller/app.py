@@ -679,12 +679,18 @@ class GradeFillerApp:
         holder = ft.Column([], spacing=10)
         status = ft.Text("")
 
+        # Example values only where a column has no real name to go by;
+        # the Review step's preview is the real check.
         def portal_option(g: automation.GridColumn) -> ft.dropdown.Option:
+            if not matching.is_generic_label(g.label):
+                return ft.dropdown.Option(key=str(g.index), text=g.label)
             sample = g.sample_value
             hint = f"  (now: {sample})" if sample else "  (empty)"
             return ft.dropdown.Option(key=str(g.index), text=f"{g.label}{hint}")
 
         def excel_option(col: str) -> ft.dropdown.Option:
+            if not str(col).startswith("Unnamed: "):
+                return ft.dropdown.Option(key=col, text=col)
             sample = next((_fmt(v) for v in self.df[col] if _fmt(v)), "")
             return ft.dropdown.Option(key=col, text=f"{col}  (e.g. {sample})" if sample else col)
 
