@@ -79,6 +79,7 @@ class GradeFillerApp:
 
         # Step 3/4
         self.grid: list[automation.GridColumn] = []
+        self.grid_choices: list[automation.GridInfo] = []  # all tables found, best first
         self.labels_found = True
         self.id_portal: Optional[int] = None
         self.id_excel: Optional[str] = None
@@ -460,9 +461,9 @@ class GradeFillerApp:
 
         return self._step_layout(
             "Step 3: Open the grade table",
-            "In the browser, go to the exact course, section and grade table you want to "
-            "fill (every course's table is different, so this part is up to you). "
-            "Then come back here.",
+            "In the browser, go to the exact course and section you want to fill and open "
+            "its grade table (if it opens in a popup, leave the popup open). Every course's "
+            "table is different, so this part is up to you. Then come back here.",
             [ft.Row([open_btn, ready_btn], wrap=True), status],
             back_to=STEP_EXCEL,
         )
@@ -472,33 +473,36 @@ class GradeFillerApp:
 
         def task():
             session = self._session()
-            if not session.find_grid_page(timeout_ms=5000):
-                return None
-            scan = automation.scan_grid(session.page)
+            grids = session.find_grids(timeout_ms=5000)
             try:
                 session.save_session()  # keep the saved login fresh
             except Exception:
                 pass
-            return scan
+            return grids
 
-        def ok(scan):
-            if scan is None:
+        def ok(grids):
+            grids = [g for g in grids if g.cols > 0]
+            if not grids:
                 on_fail(
                     "Couldn't find a student grade table in the browser. Make sure it's open "
                     "and shows the students, then try again."
                 )
                 return
-            if not scan.columns:
-                on_fail("The grade table seems to be empty (no students). Open a table with students.")
-                return
-            self.grid = scan.columns
-            self.labels_found = scan.labels_found
+            self.grid_choices = grids
+            self._use_grid(grids[0])
             on_done()
 
         def err(e):
             on_fail(f"Couldn't read the grade table: {self._error_text(e)}")
 
         self.pw.submit(task, ok, err)
+
+    def _use_grid(self, info: automation.GridInfo):
+        """Make this browser table the one to read and fill."""
+        self._session().grid = info
+        scan = automation.scan_grid(info)
+        self.grid = scan.columns
+        self.labels_found = scan.labels_found
 
     # ---------- Step 4: Column mapping ----------
 
@@ -507,7 +511,13 @@ class GradeFillerApp:
 
     def _suggest_mapping(self):
         """Pre-fill ID and grade pairs. Only when file/sheet/table changed."""
-        source = (self.excel_path, self.sheet_name, tuple(g.label for g in self.grid), len(self.grid))
+        chosen = self._session().grid
+        source = (
+            self.excel_path,
+            self.sheet_name,
+            chosen.key if chosen else None,
+            tuple(g.label for g in self.grid),
+        )
         if source == self._mapping_source:
             # Same data: keep the user's choices, just drop ones that no longer exist.
             self._prune_mapping()
@@ -618,8 +628,9 @@ class GradeFillerApp:
                 else:
                     self._set_status(
                         id_check,
-                        "None of the portal's student IDs appear in this Excel column — "
-                        "check that both dropdowns are the ID columns, and that this is the right sheet.",
+                        "None of the portal's student IDs appear in this Excel column. Check that both "
+                        "dropdowns are ID columns and that this is the right sheet. If the grade table "
+                        "opens in a popup, make sure the popup is open, then click “Read the browser again” below.",
                         ERROR,
                     )
 
@@ -717,6 +728,40 @@ class GradeFillerApp:
             )
 
             notices = []
+            if len(self.grid_choices) > 1:
+                current = self._session().grid
+                table_dd = ft.Dropdown(
+                    label="Table to fill",
+                    options=[
+                        ft.dropdown.Option(key=g.key, text=f"Table {n + 1} · {g.describe()}")
+                        for n, g in enumerate(self.grid_choices)
+                    ],
+                    value=current.key if current else None,
+                    expand=True,
+                )
+
+                def on_table(e):
+                    info = next((g for g in self.grid_choices if g.key == e.control.value), None)
+                    if info:
+                        self._use_grid(info)
+                        self._suggest_mapping()
+                        render()
+
+                table_dd.on_select = on_table
+                notices.append(
+                    self._card(
+                        f"{len(self.grid_choices)} tables are open in the browser",
+                        [
+                            ft.Text(
+                                "The one in front (e.g. the popup with the students' grades) was picked. "
+                                "If the columns below look wrong, choose the other table here.",
+                                size=13,
+                                color=INFO,
+                            ),
+                            ft.Row([table_dd]),
+                        ],
+                    )
+                )
             if not self.labels_found:
                 notices.append(
                     self._notice(
@@ -738,7 +783,7 @@ class GradeFillerApp:
                 self._scan(on_done=lambda: (self._set_status(status, ""), self._go_to(STEP_MAP)), on_fail=fail)
 
             rescan_btn = ft.TextButton(
-                "I opened a different table — read it again",
+                "Wrong or changed table? Read the browser again",
                 icon=ft.Icons.REFRESH,
                 on_click=rescan,
             )

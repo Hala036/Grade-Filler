@@ -21,6 +21,7 @@ from playwright.sync_api import (
     sync_playwright,
     Browser,
     BrowserContext,
+    Frame,
     Page,
     TimeoutError as PwTimeoutError,
     Error as PwError,
@@ -149,6 +150,7 @@ class PortalSession:
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
+        self.grid: Optional[GridInfo] = None  # the table chosen for filling
 
     def _alive(self) -> bool:
         try:
@@ -193,21 +195,33 @@ class PortalSession:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.context.storage_state(path=str(self.state_path))
 
-    def find_grid_page(self, timeout_ms: int = 5000) -> bool:
-        """Look for the grade grid in any open tab; make that tab current."""
+    def find_grids(self, timeout_ms: int = 5000) -> list["GridInfo"]:
+        """Every grade-style table in every tab and frame, best guess first.
+
+        The portal shows a list of groups as one table and opens the real
+        grade table in a popup on top of it, so several tables are normal.
+        The one in front (popup / newest window) is ranked first.
+        """
         if not self._alive():
-            return False
+            return []
         deadline = time.monotonic() + timeout_ms / 1000
         while True:
-            for p in reversed(self.context.pages):
-                try:
-                    if not p.is_closed() and p.locator(ROW_LOCATOR).count() > 0:
-                        self.page = p
-                        return True
-                except PwError:
+            grids: list[GridInfo] = []
+            for pi, p in enumerate(self.context.pages):
+                if p.is_closed():
                     continue
-            if time.monotonic() >= deadline:
-                return False
+                for fi, f in enumerate(p.frames):
+                    try:
+                        found = f.evaluate(_DISCOVER_JS, [ROW_LOCATOR, GRID_ATTR, f"p{pi}f{fi}g"])
+                    except PwError:
+                        continue  # frame navigated/detached mid-scan
+                    for d in found:
+                        grids.append(
+                            GridInfo(page=p, frame=f, page_index=pi, in_frame=f != p.main_frame, **d)
+                        )
+            if grids or time.monotonic() >= deadline:
+                grids.sort(key=GridInfo.priority, reverse=True)
+                return grids
             time.sleep(0.25)
 
     def close(self) -> None:
@@ -226,66 +240,147 @@ class PortalSession:
             self.browser = None
             self.context = None
             self.page = None
+            self.grid = None
 
 
-# ---------- grid scanning ----------
+# ---------- grid discovery & scanning ----------
 
 # The row selector (tr.ev_dhx_web / tr.odd_dhx_web) is the classic dhtmlxGrid
-# skin's row class naming. That grid renders its header in a separate
-# scrollable container from the body, roughly:
-#   div.gridbox_dhx_web
-#     div.hdr > div/table > tr > td.hdrcell   (header, one row of cells)
-#     div.obj > table > tr.ev_dhx_web/.odd_dhx_web > td   (body rows)
-# Exact wrapper tag/nesting varies by dhtmlx build, so try several header
-# selectors most-specific first.
-_HEADER_SELECTORS = [
-    "div.hdr td.hdrcell",
-    "div.hdr td",
-    "div.hdr th",
-    "table.hdr td",
-    "table.hdr th",
-    "[class*='hdr'] td[class*='hdrcell']",
-]
+# skin's row class naming. A page can hold several such grids (the portal's
+# group list, plus the grade table in a popup on top of it), so rows are
+# grouped by the <table> they belong to, and each grid's container is tagged
+# with GRID_ATTR so later steps only ever touch that one grid. dhtmlxGrid
+# renders the header as a separate table in the same container, roughly:
+#   div.gridbox
+#     div.xhdr > table.hdr > tr (sizing row) + tr > td > div.hdrcell
+#     div.objbox > table.obj > tr.ev_dhx_web/.odd_dhx_web > td
+GRID_ATTR = "data-gradefiller-grid"
+
+_DISCOVER_JS = r"""
+([rowSel, attr, prefix]) => {
+  document.querySelectorAll('[' + attr + ']').forEach(e => e.removeAttribute(attr));
+  const groups = new Map();
+  for (const r of document.querySelectorAll(rowSel)) {
+    const t = r.closest('table');
+    if (!t) continue;
+    if (!groups.has(t)) groups.set(t, []);
+    groups.get(t).push(r);
+  }
+  const tables = Array.from(groups.keys());
+  const text = el => (el.innerText || '').trim();
+  return tables.map((t, i) => {
+    // Climb to the grid's container, but never so far that it holds another grid.
+    let c = t;
+    for (let k = 0; k < 8 && c.parentElement && c.parentElement !== document.body; k++) {
+      const p = c.parentElement;
+      if (tables.some(o => o !== t && p.contains(o))) break;
+      c = p;
+      if (/gridbox/i.test(String(c.className || ''))) break;
+    }
+    const key = prefix + i;
+    c.setAttribute(attr, key);
+
+    const rows = groups.get(t);
+    const matrix = rows.map(r => Array.from(r.cells).map(text));
+    const cols = Math.max(0, ...matrix.map(r => r.length));
+
+    let labels = null;
+    for (const ht of c.querySelectorAll('table')) {
+      if (ht === t || t.contains(ht)) continue;
+      for (const hr of Array.from(ht.rows).reverse()) {
+        const texts = Array.from(hr.cells).map(text);
+        if (texts.length === cols && texts.every(Boolean)) { labels = texts; break; }
+      }
+      if (labels) break;
+    }
+
+    const rect = c.getBoundingClientRect();
+    const style = getComputedStyle(c);
+    const visible = rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden';
+    let onTop = false;
+    if (visible) {
+      const x = Math.min(Math.max(rect.left + rect.width / 2, 0), innerWidth - 1);
+      const y = Math.min(Math.max(rect.top + Math.min(rect.height / 2, 80), 0), innerHeight - 1);
+      const hit = document.elementFromPoint(x, y);
+      onTop = !!hit && c.contains(hit);
+    }
+    let z = 0;
+    for (let el = c; el && el !== document.documentElement; el = el.parentElement) {
+      const v = parseInt(getComputedStyle(el).zIndex, 10);
+      if (!isNaN(v)) z = Math.max(z, v);
+    }
+    return {key, rows: rows.length, cols, labels, visible, on_top: onTop, z, order: i, matrix};
+  });
+}
+"""
+
+
+@dataclass
+class GridInfo:
+    """One grade-style table found in the browser."""
+    page: Page
+    frame: Frame
+    key: str
+    page_index: int
+    in_frame: bool
+    rows: int
+    cols: int
+    labels: Optional[list[str]]
+    visible: bool
+    on_top: bool
+    z: int
+    order: int
+    matrix: list[list[str]] = field(repr=False, default_factory=list)
+
+    def priority(self):
+        # Visible and in front first; then newer windows, embedded frames,
+        # higher stacking (popups), and finally later in the page.
+        return (self.visible, self.on_top, self.page_index, self.in_frame, self.z, self.order)
+
+    def root(self):
+        return self.frame.locator(f'[{GRID_ATTR}="{self.key}"]')
+
+    def row_locator(self):
+        return self.root().locator(ROW_LOCATOR)
+
+    def describe(self) -> str:
+        if self.labels:
+            cols = ", ".join(self.labels[:5]) + ("…" if len(self.labels) > 5 else "")
+        else:
+            first = next((r for r in self.matrix if any(r)), [])
+            cols = "e.g. " + ", ".join(v for v in first if v)[:60]
+        front = " — in front" if self.on_top else ""
+        return f"{self.rows} rows: {cols}{front}"
+
 
 _READ_ROWS_JS = "rows => rows.map(r => Array.from(r.cells).map(c => (c.innerText || '').trim()))"
 
 
-def read_grid_matrix(page: Page) -> list[list[str]]:
-    """All grid rows as lists of cell text."""
-    return page.locator(ROW_LOCATOR).evaluate_all(_READ_ROWS_JS)
+def read_grid_matrix(grid: GridInfo) -> list[list[str]]:
+    """All rows of one grid as lists of cell text."""
+    return grid.row_locator().evaluate_all(_READ_ROWS_JS)
 
 
-def scan_grid(page: Page) -> GridScan:
-    """Inspect the live DHTMLX grid: its columns, labels and current values.
+def scan_grid(grid: GridInfo) -> GridScan:
+    """Columns, labels and current values of one discovered grid.
 
     If header labels can't be read, columns get generic "Column N" labels;
     the UI shows example values from each column so they can still be told
     apart without typing anything.
     """
-    matrix = read_grid_matrix(page)
-    cell_count = max((len(r) for r in matrix), default=0)
+    matrix = grid.matrix
 
     def col_values(i):
         return [r[i] if i < len(r) else "" for r in matrix]
 
-    labels: Optional[list[str]] = None
-    for sel in _HEADER_SELECTORS:
-        loc = page.locator(sel)
-        if loc.count() != cell_count:
-            # Matched something that doesn't line up with the data columns.
-            continue
-        candidate = [t.strip() for t in loc.all_inner_texts()]
-        if all(candidate):
-            labels = candidate
-            break
-
+    labels = grid.labels
     columns = [
         GridColumn(
             index=i,
             label=labels[i] if labels else f"Column {i + 1}",
             values=col_values(i),
         )
-        for i in range(cell_count)
+        for i in range(grid.cols)
     ]
     return GridScan(columns=columns, labels_found=labels is not None)
 
@@ -387,11 +482,13 @@ def build_fill_plan(job: FillJob, df: pd.DataFrame, portal_ids: Optional[list[st
 
 # ---------- filling ----------
 
-def row_for_student(page: Page, sid: str, id_column_index: int):
-    rows = page.locator(ROW_LOCATOR)
+def row_for_student(grid: GridInfo, sid: str, id_column_index: int):
+    """The student's row, searched only inside the chosen grid."""
     td_n = id_column_index + 1  # nth-child is 1-based
     escaped = sid.replace("\\", "\\\\").replace('"', '\\"')
-    return rows.filter(has=page.locator(f'td:nth-child({td_n}):text-is("{escaped}")')).first
+    return grid.row_locator().filter(
+        has=grid.frame.locator(f'td:nth-child({td_n}):text-is("{escaped}")')
+    ).first
 
 
 def _cell_shows(text: str, value: int) -> bool:
@@ -405,17 +502,21 @@ def _cell_shows(text: str, value: int) -> bool:
         return True
 
 
-def edit_cell_commit(page: Page, row, td_index: int, value: int) -> None:
+def edit_cell_commit(page: Page, row, td_index: int, value: int, focus_index: int) -> None:
     """Double-click a DHTMLX cell, select-all, type, commit with Tab.
 
     Retries a few times since the grid is known to occasionally ignore the
     first edit attempt. Success means the cell now shows the new value (not
     just "something"), so a stale old value isn't mistaken for success.
+
+    Before editing, the row's own (read-only) ID cell is clicked to close any
+    editor left open by the previous Tab. This used to click the middle of
+    the page, which with a popup open could land on the table behind it.
     """
     modifier = "Meta" if sys.platform == "darwin" else "Control"
 
     page.bring_to_front()
-    page.locator("body").click()
+    row.locator("td").nth(focus_index).click()
 
     cell = row.locator("td").nth(td_index)
     cell.scroll_into_view_if_needed()
@@ -456,12 +557,17 @@ def run_fill(
     on_progress: ProgressCallback,
     should_stop: Callable[[], bool],
 ) -> FillResult:
-    if not session.find_grid_page(timeout_ms=5000):
+    grid = session.grid
+    try:
+        still_there = grid is not None and not grid.page.is_closed() and grid.root().count() > 0
+    except PwError:
+        still_there = False
+    if not still_there:
         raise RuntimeError(
-            "The grade table isn't open in the browser anymore. "
-            "Open it again, then press Start."
+            "The grade table was closed or reloaded in the browser. Open it again, go back to "
+            "“Match Columns” and click “Read the browser again”, then come back and press Start."
         )
-    page = session.page
+    page = grid.page
     result = FillResult()
     total = len(plan.students)
 
@@ -471,7 +577,7 @@ def run_fill(
             on_progress(i - 1, total, "Stopped by user.")
             break
 
-        row = row_for_student(page, student.sid, job.id_mapping.portal_index)
+        row = row_for_student(grid, student.sid, job.id_mapping.portal_index)
         try:
             row.wait_for(timeout=6000)
         except PwTimeoutError:
@@ -484,7 +590,7 @@ def run_fill(
         failed_here = []
         for w in student.writes:
             try:
-                edit_cell_commit(page, row, w.mapping.portal_index, w.value)
+                edit_cell_commit(page, row, w.mapping.portal_index, w.value, job.id_mapping.portal_index)
             except (RuntimeError, PwTimeoutError) as e:
                 failed_here.append(w.mapping.portal_label)
                 result.failed.append(f"{student.sid} · {w.mapping.portal_label} = {w.value}: {e}")
