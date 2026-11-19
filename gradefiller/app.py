@@ -113,6 +113,8 @@ class GradeFillerApp:
         self.id_excel: Optional[str] = None
         self.grade_pairs: list[dict] = []  # {"excel": str|None, "portal": int|None}
         self.blank_as_zero = False
+        self.round_up_on = False
+        self.round_rule = automation.RoundUp.usual()
         self._mapping_source = None  # what the current mapping was suggested for
 
         # Step 5
@@ -642,6 +644,28 @@ class GradeFillerApp:
             general.append("Add at least one grade column to fill.")
         return general, per_row
 
+    def _round_up_rule(self) -> tuple[Optional[automation.RoundUp], Optional[str]]:
+        """(rule, problem). Rule is None when rounding is off or nothing is chosen."""
+        if not self.round_up_on:
+            return None, None
+        if not self.round_rule.active:
+            return None, "Rounding is on but every box says \"stays\". Click the boxes to choose, or untick it."
+        return self.round_rule, None
+
+    @staticmethod
+    def _round_summary(rule: automation.RoundUp) -> str:
+        """The rule in words, e.g. "12.1 stays · 12.2–12.4 → 12.5 · 12.5–12.9 → 13"."""
+        parts, d = [], 1
+        while d <= 9:
+            action, e = rule.rule_for(d), d
+            while e < 9 and rule.rule_for(e + 1) == action:
+                e += 1
+            span = f"12.{d}" if d == e else f"12.{d}–12.{e}"
+            parts.append(f"{span} stays" if action == automation.KEEP
+                         else f"{span} → {automation.apply_round_up(f'12.{d}', rule)}")
+            d = e + 1
+        return " · ".join(parts)
+
     def _build_step_mapping(self) -> ft.Control:
         self._suggest_mapping()
         holder = ft.Column([], spacing=10)
@@ -793,6 +817,105 @@ class GradeFillerApp:
 
             blank_cb.on_change = on_blank
 
+            # --- Optional round-up: one box per first digit after the point ---
+            round_cb = ft.Checkbox(label="Round grades up", value=self.round_up_on)
+
+            def on_round(e):
+                self.round_up_on = bool(e.control.value)
+                render()
+
+            round_cb.on_change = on_round
+            round_controls = [round_cb]
+            if self.round_up_on:
+                rule = self.round_rule
+                looks = {  # (background, border, text) per choice
+                    automation.KEEP: (ft.Colors.GREY_100, ft.Colors.GREY_300, ft.Colors.GREY_600),
+                    automation.HALF: (ft.Colors.AMBER_50, ft.Colors.AMBER_400, ft.Colors.AMBER_900),
+                    automation.WHOLE: (ft.Colors.GREEN_50, ft.Colors.GREEN_400, ft.Colors.GREEN_800),
+                }
+
+                def set_rule(new_rule):
+                    self.round_rule = new_rule
+                    render()
+
+                def tile(d: int) -> ft.Control:
+                    action = rule.rule_for(d)
+                    bg, border, fg = looks[action]
+                    result = "stays" if action == automation.KEEP else "→ " + automation.apply_round_up(f"12.{d}", rule)
+                    return ft.Container(
+                        content=ft.Column(
+                            [
+                                ft.Text(f"12.{d}", size=14, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_GREY_900),
+                                ft.Text(result, size=12, color=fg, weight=ft.FontWeight.W_500),
+                            ],
+                            spacing=2,
+                            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                        width=70,
+                        padding=ft.Padding.symmetric(vertical=8, horizontal=2),
+                        bgcolor=bg,
+                        border=ft.Border.all(1.5, border),
+                        border_radius=10,
+                        alignment=ft.Alignment.CENTER,
+                        ink=True,
+                        tooltip="Click to change",
+                        on_click=lambda _, d=d: set_rule(rule.with_next(d)),
+                    )
+
+                def legend(action: str, text: str) -> ft.Control:
+                    bg, border, _ = looks[action]
+                    return ft.Row(
+                        [
+                            ft.Container(width=14, height=14, bgcolor=bg, border=ft.Border.all(1.5, border),
+                                         border_radius=4),
+                            ft.Text(text, size=12, color=INFO),
+                        ],
+                        spacing=4,
+                    )
+
+                _, problem = self._round_up_rule()
+                round_controls.append(
+                    ft.Container(
+                        content=ft.Column(
+                            [
+                                ft.Text(
+                                    "Click a box to change what happens to grades with that digit after the point. "
+                                    "(12 is just an example; the same goes for every grade.)",
+                                    size=13,
+                                    color=INFO,
+                                ),
+                                ft.Row([tile(d) for d in range(1, 10)], spacing=6, wrap=True, run_spacing=6),
+                                ft.Row(
+                                    [
+                                        legend(automation.KEEP, "stays"),
+                                        legend(automation.HALF, "up to .5"),
+                                        legend(automation.WHOLE, "up to the next whole number"),
+                                    ],
+                                    spacing=16,
+                                    wrap=True,
+                                ),
+                                ft.Text(problem, size=12, color=ERROR) if problem else ft.Text(
+                                    self._round_summary(rule) + ". Whole numbers stay as they are.",
+                                    size=12,
+                                    color=INFO,
+                                ),
+                                ft.Row(
+                                    [
+                                        ft.TextButton("Use the usual rule",
+                                                      on_click=lambda _: set_rule(automation.RoundUp.usual())),
+                                        ft.TextButton("Set all to \"stays\"",
+                                                      on_click=lambda _: set_rule(automation.RoundUp())),
+                                    ],
+                                    spacing=4,
+                                    wrap=True,
+                                ),
+                            ],
+                            spacing=10,
+                        ),
+                        padding=ft.Padding.only(left=32),
+                    )
+                )
+
             filled = sum(1 for p in self.grade_pairs if p["portal"] is not None and p["excel"])
             grades_card = self._card(
                 "Grades to fill",
@@ -806,6 +929,7 @@ class GradeFillerApp:
                     *rows,
                     ft.TextButton("Add another column", icon=ft.Icons.ADD, on_click=add_row),
                     blank_cb,
+                    *round_controls,
                 ],
             )
 
@@ -892,6 +1016,11 @@ class GradeFillerApp:
                     self._set_status(status, " ".join(general_now) or "Fix the rows marked in red above.", ERROR)
                     self.page.update()
                     return
+                _, round_problem = self._round_up_rule()
+                if round_problem:
+                    self._set_status(status, round_problem, ERROR)
+                    self.page.update()
+                    return
                 self._build_job_and_plan()
                 self._go_to(STEP_RUN)
 
@@ -926,6 +1055,7 @@ class GradeFillerApp:
             id_mapping=automation.ColumnMapping(idg.index, idg.label, self.id_excel),
             grade_mappings=mappings,
             blank_as_zero=self.blank_as_zero,
+            round_up=self._round_up_rule()[0],
         )
         self.plan = automation.build_fill_plan(self.job, self.df, portal_ids=idg.values)
 
@@ -958,6 +1088,17 @@ class GradeFillerApp:
         if plan.invalid_cells:
             warnings.append(f"{len(plan.invalid_cells)} cells aren't numbers")
             details.append("Not numbers (skipped):\n" + "\n".join(f"  • {c}" for c in plan.invalid_cells[:30]))
+        if job.round_up is not None:
+            n = len(plan.rounded)
+            summary.append(self._fact(
+                ft.Icons.TRENDING_UP,
+                f"{n} grade{'s' if n != 1 else ''} will be rounded up ({self._round_summary(job.round_up)})."
+                if n else "Round-up is on, but no grades needed rounding.",
+                INFO,
+            ))
+            if n:
+                details.append("Rounded up:\n" + "\n".join(f"  • {r}" for r in plan.rounded[:30])
+                               + (f"\n  … and {n - 30} more" if n > 30 else ""))
         if plan.blank_cells:
             details.append(f"{plan.blank_cells} blank Excel cells will be left as they are.")
         if plan.rows_without_id:

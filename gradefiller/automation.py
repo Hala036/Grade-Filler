@@ -15,7 +15,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -103,6 +103,70 @@ def parse_grade(x) -> Optional[str]:
     return s
 
 
+# What a first decimal digit can turn into.
+KEEP, HALF, WHOLE = "keep", "half", "whole"
+
+
+@dataclass
+class RoundUp:
+    """Optional round-up, decided by the first digit after the decimal point.
+
+    `rules[d - 1]` says what happens to a grade whose first decimal digit is
+    d (1..9): KEEP leaves it, HALF makes it whole + .5, WHOLE makes it the next
+    whole number. Whole numbers and a first digit of 0 (12.05) are never
+    changed. HALF is only allowed for digits 1-4, so a grade never goes down.
+    """
+    rules: tuple[str, ...] = (KEEP,) * 9
+
+    @staticmethod
+    def usual() -> "RoundUp":
+        """The teacher's usual rule: .1-.4 up to .5, .5-.9 up to the next whole number."""
+        return RoundUp((HALF,) * 4 + (WHOLE,) * 5)
+
+    @staticmethod
+    def allowed(digit: int) -> tuple[str, ...]:
+        """The choices for a first decimal digit, in the order a click cycles them."""
+        return (KEEP, HALF, WHOLE) if digit < 5 else (KEEP, WHOLE)
+
+    def rule_for(self, digit: int) -> str:
+        r = self.rules[digit - 1]
+        return r if r in self.allowed(digit) else KEEP
+
+    def with_next(self, digit: int) -> "RoundUp":
+        """The same rule with this digit's choice moved to the next one."""
+        options = self.allowed(digit)
+        nxt = options[(options.index(self.rule_for(digit)) + 1) % len(options)]
+        rules = list(self.rules)
+        rules[digit - 1] = nxt
+        return RoundUp(tuple(rules))
+
+    @property
+    def active(self) -> bool:
+        return any(self.rule_for(d) != KEEP for d in range(1, 10))
+
+
+def apply_round_up(text: str, rule: RoundUp) -> str:
+    """Round a grade's text by the rule; returns the text to type."""
+    try:
+        d = Decimal(text.strip())
+    except InvalidOperation:
+        return text
+    if not d.is_finite() or d < 0:
+        return text
+    whole = d.to_integral_value(rounding=ROUND_FLOOR)
+    digit = int((d - whole) * 10)  # first digit after the point
+    if digit == 0:
+        return text
+    action = rule.rule_for(digit)
+    if action == HALF:
+        out = whole + Decimal("0.5")
+    elif action == WHOLE:
+        out = whole + 1
+    else:
+        return text
+    return format(out.normalize(), "f")
+
+
 def looks_numeric(values, threshold: float = 0.6) -> bool:
     """True if most non-blank values parse as numbers."""
     non_blank = [v for v in values if not _is_blank(v)]
@@ -135,6 +199,7 @@ class FillJob:
     id_mapping: ColumnMapping
     grade_mappings: list[ColumnMapping] = field(default_factory=list)
     blank_as_zero: bool = False
+    round_up: Optional[RoundUp] = None  # None: type grades exactly as Excel shows them
     pace_seconds: float = PACE_SECONDS_DEFAULT
 
 
@@ -584,6 +649,7 @@ class FillPlan:
     invalid_cells: list[str] = field(default_factory=list)
     blank_cells: int = 0
     rows_without_id: int = 0
+    rounded: list[str] = field(default_factory=list)  # e.g. "Row 5 (2201…), 'Quiz': 12.3 → 12.5"
 
     @property
     def cell_count(self) -> int:
@@ -632,6 +698,11 @@ def build_fill_plan(job: FillJob, df: pd.DataFrame, portal_ids: Optional[list[st
                 else:
                     plan.blank_cells += 1
                     continue
+            if job.round_up is not None:
+                new = apply_round_up(value, job.round_up)
+                if new != value:
+                    plan.rounded.append(f"Row {excel_row} ({sid}), '{m.excel_column}': {value} → {new}")
+                    value = new
             writes.append(CellWrite(m, value))
 
         if writes:
