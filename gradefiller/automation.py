@@ -9,6 +9,7 @@ Excel-column -> portal-column mappings.
 """
 from __future__ import annotations
 
+import logging
 import math
 import re
 import sys
@@ -32,6 +33,22 @@ from playwright.sync_api import (
 
 PORTAL_LOGIN_URL = "https://portal.alquds.edu/en/login"
 COURSE_PAGE_URL = "https://portal.alquds.edu/en/registration/marks/course_list"
+
+log = logging.getLogger("gradefiller")
+
+
+def _ms(since: float) -> float:
+    return (time.perf_counter() - since) * 1000
+
+
+def _short_url(frame) -> str:
+    try:
+        url = frame.url or ""
+    except PwError:
+        return ""
+    url = url.split("?", 1)[0]  # drop query strings (may carry session data)
+    return url if len(url) <= 70 else url[:67] + "..."
+
 
 # DHTMLX grid row selector. Rows come in two alternating classes.
 ROW_LOCATOR = "tr.ev_dhx_web, tr.odd_dhx_web"
@@ -209,16 +226,22 @@ class PortalSession:
         """
         if not self._alive():
             return []
+        started = time.perf_counter()
         deadline = time.monotonic() + timeout_ms / 1000
+        attempt = 0
         while True:
+            attempt += 1
             grids: list[GridInfo] = []
             for pi, p in enumerate(self.context.pages):
                 if p.is_closed():
                     continue
                 for fi, f in enumerate(p.frames):
+                    t0 = time.perf_counter()
                     try:
                         found = f.evaluate(_DISCOVER_JS, [ROW_LOCATOR, GRID_ATTR, f"p{pi}f{fi}g", POPUP_TITLE])
-                    except PwError:
+                    except PwError as e:
+                        log.info("  tab %d frame %d: skipped after %.0f ms (%s) %s", pi, fi,
+                                 _ms(t0), str(e).splitlines()[0][:60], _short_url(f))
                         continue  # frame navigated/detached mid-scan
                     in_frame = f != p.main_frame
                     if in_frame and found and not any(d["titled"] for d in found):
@@ -226,10 +249,13 @@ class PortalSession:
                         framed_title = _frame_is_titled(f)
                         if framed_title and len(found) == 1:
                             found[0]["titled"] = True
+                    log.info("  tab %d frame %d: %.0f ms, %d table(s)%s %s", pi, fi, _ms(t0), len(found),
+                             " [Mark Entry]" if any(d["titled"] for d in found) else "", _short_url(f))
                     for d in found:
                         grids.append(GridInfo(page=p, frame=f, page_index=pi, in_frame=in_frame, **d))
             if grids or time.monotonic() >= deadline:
                 grids.sort(key=GridInfo.priority, reverse=True)
+                log.info("find_grids: %d table(s) in %.0f ms (%d attempt(s))", len(grids), _ms(started), attempt)
                 return grids
             time.sleep(0.25)
 

@@ -18,7 +18,9 @@ owns one dedicated thread for the whole browser session's lifetime.
 """
 from __future__ import annotations
 
+import logging
 import threading
+import time
 import traceback
 from typing import Optional
 
@@ -26,8 +28,31 @@ import flet as ft
 import pandas as pd
 
 from gradefiller import automation, matching
-from gradefiller.paths import state_path
+from gradefiller.paths import app_data_dir, state_path
 from gradefiller.playwright_worker import PlaywrightWorker
+
+log = logging.getLogger("gradefiller")
+
+
+def _ms(since: float) -> float:
+    return (time.perf_counter() - since) * 1000
+
+
+def setup_logging() -> None:
+    """Timing/diagnostic lines go to the terminal and to GradeFiller/gradefiller.log."""
+    if log.handlers:
+        return
+    log.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(message)s", "%H:%M:%S")
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    log.addHandler(console)
+    try:
+        file = logging.FileHandler(app_data_dir() / "gradefiller.log", encoding="utf-8")
+        file.setFormatter(fmt)
+        log.addHandler(file)
+    except OSError:
+        pass  # logging must never stop the app
 
 STEP_LOGIN, STEP_EXCEL, STEP_GRID, STEP_MAP, STEP_RUN = range(5)
 
@@ -474,38 +499,55 @@ class GradeFillerApp:
     def _scan(self, on_done, on_fail):
         """Find the grade table in the browser and read its columns."""
 
+        clicked = time.perf_counter()
+
         def task():
+            log.info("Looking for the grade table (waited %.0f ms for the browser to be free)", _ms(clicked))
             session = self._session()
             grids = session.find_grids(timeout_ms=5000)
+            t = time.perf_counter()
             try:
                 session.save_session()  # keep the saved login fresh
             except Exception:
                 pass
+            log.info("save_session: %.0f ms", _ms(t))
             return grids
 
         def ok(grids):
             grids = [g for g in grids if g.cols > 0]
             if not grids:
+                log.info("No tables found (%.0f ms total)", _ms(clicked))
                 on_fail(
                     "Couldn't find a student grade table in the browser. Make sure it's open "
                     "and shows the students, then try again."
                 )
                 return
+            t = time.perf_counter()
             ranked, confident = matching.rank_grids(grids, self.df)
             titled = [m for m in ranked if m.grid.titled]
             if len(titled) == 1:
                 # The "Mark Entry" popup is the table the user opened on purpose.
                 ranked = titled + [m for m in ranked if m is not titled[0]]
                 confident = True
+                how = "by the 'Mark Entry' popup title"
+            elif titled:
+                how = f"by student IDs ({len(titled)} tables looked like Mark Entry)"
+            else:
+                how = "by student IDs (no 'Mark Entry' popup found)"
+            log.info("Table chosen %s: %d students; %s; ranking %.0f ms",
+                     how, ranked[0].grid.rows, "no question needed" if confident else "user must pick", _ms(t))
             self.grid_choices = [m.grid for m in ranked]
             self.table_match = ranked[0]
             # Ask only when there's a real choice and the data didn't settle it.
             self._show_table_picker = len(ranked) > 1 and not confident
             self._show_id_editor = False
             self._use_grid(ranked[0].grid)
+            t = time.perf_counter()
             on_done()
+            log.info("Next screen built in %.0f ms; %.0f ms in total since the click", _ms(t), _ms(clicked))
 
         def err(e):
+            log.info("Table search failed after %.0f ms: %s", _ms(clicked), e)
             on_fail(f"Couldn't read the grade table: {self._error_text(e)}")
 
         self.pw.submit(task, ok, err)
@@ -1151,6 +1193,7 @@ class GradeFillerApp:
 
 
 def main(page: ft.Page):
+    setup_logging()
     GradeFillerApp(page)
 
 
