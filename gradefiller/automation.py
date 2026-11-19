@@ -103,46 +103,37 @@ def parse_grade(x) -> Optional[str]:
     return s
 
 
-# What a first decimal digit can turn into.
-KEEP, HALF, WHOLE = "keep", "half", "whole"
-
-
-@dataclass
+@dataclass(frozen=True)
 class RoundUp:
     """Optional round-up, decided by the first digit after the decimal point.
 
-    `rules[d - 1]` says what happens to a grade whose first decimal digit is
-    d (1..9): KEEP leaves it, HALF makes it whole + .5, WHOLE makes it the next
-    whole number. Whole numbers and a first digit of 0 (12.05) are never
-    changed. HALF is only allowed for digits 1-4, so a grade never goes down.
+    Two joined arrows on a 0-1 line, in tenths (0..10), start <= joint <= end:
+      * digits start .. joint-1 go up to .joint   (the first, amber arrow)
+      * digits joint .. end-1   go up to .end     (the second, green arrow;
+        end 10 means the next whole number)
+      * anything else stays, and whole numbers never change.
+    The teacher's usual rule is (1, 5, 10): .1-.4 -> .5, .5-.9 -> next whole.
+    An arrow only points forward, so a grade never goes down.
     """
-    rules: tuple[str, ...] = (KEEP,) * 9
+    start: int = 1
+    joint: int = 5
+    end: int = 10
 
-    @staticmethod
-    def usual() -> "RoundUp":
-        """The teacher's usual rule: .1-.4 up to .5, .5-.9 up to the next whole number."""
-        return RoundUp((HALF,) * 4 + (WHOLE,) * 5)
+    def __post_init__(self):
+        if not 0 <= self.start <= self.joint <= self.end <= 10:
+            raise ValueError(f"round-up points out of order: {self}")
 
-    @staticmethod
-    def allowed(digit: int) -> tuple[str, ...]:
-        """The choices for a first decimal digit, in the order a click cycles them."""
-        return (KEEP, HALF, WHOLE) if digit < 5 else (KEEP, WHOLE)
-
-    def rule_for(self, digit: int) -> str:
-        r = self.rules[digit - 1]
-        return r if r in self.allowed(digit) else KEEP
-
-    def with_next(self, digit: int) -> "RoundUp":
-        """The same rule with this digit's choice moved to the next one."""
-        options = self.allowed(digit)
-        nxt = options[(options.index(self.rule_for(digit)) + 1) % len(options)]
-        rules = list(self.rules)
-        rules[digit - 1] = nxt
-        return RoundUp(tuple(rules))
+    def target(self, digit: int) -> Optional[int]:
+        """Where a first decimal digit (0-9) goes, in tenths; None if it stays."""
+        if self.start <= digit < self.joint:
+            return self.joint
+        if self.joint <= digit < self.end:
+            return self.end
+        return None
 
     @property
     def active(self) -> bool:
-        return any(self.rule_for(d) != KEEP for d in range(1, 10))
+        return self.start < self.joint or self.joint < self.end
 
 
 def apply_round_up(text: str, rule: RoundUp) -> str:
@@ -154,17 +145,13 @@ def apply_round_up(text: str, rule: RoundUp) -> str:
     if not d.is_finite() or d < 0:
         return text
     whole = d.to_integral_value(rounding=ROUND_FLOOR)
-    digit = int((d - whole) * 10)  # first digit after the point
-    if digit == 0:
+    frac = d - whole
+    if frac == 0:
         return text
-    action = rule.rule_for(digit)
-    if action == HALF:
-        out = whole + Decimal("0.5")
-    elif action == WHOLE:
-        out = whole + 1
-    else:
+    target = rule.target(int(frac * 10))  # first digit after the point
+    if target is None:
         return text
-    return format(out.normalize(), "f")
+    return format((whole + Decimal(target) / 10).normalize(), "f")
 
 
 def looks_numeric(values, threshold: float = 0.6) -> bool:
