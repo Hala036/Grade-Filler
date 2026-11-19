@@ -845,6 +845,9 @@ class GradeFillerApp:
                 OK if plan.students else ERROR,
             )
         ]
+        summary.append(
+            self._fact(ft.Icons.CONTENT_COPY, "Grades are copied exactly as Excel shows them (no extra rounding).")
+        )
         if plan.blank_cells:
             summary.append(self._fact(ft.Icons.REMOVE, f"{plan.blank_cells} blank Excel cells will be left unchanged."))
         if plan.not_in_portal:

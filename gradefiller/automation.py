@@ -10,12 +10,15 @@ Excel-column -> portal-column mappings.
 from __future__ import annotations
 
 import math
+import re
 import sys
 import time
 from dataclasses import dataclass, field
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Callable, Optional
 
+import openpyxl
 import pandas as pd
 from playwright.sync_api import (
     sync_playwright,
@@ -37,10 +40,6 @@ PACE_SECONDS_DEFAULT = 0.12
 
 
 # ---------- value normalization ----------
-
-def round_half_up(x: float) -> int:
-    return int(math.floor(x + 0.5))
-
 
 def _is_blank(x) -> bool:
     if x is None:
@@ -71,14 +70,20 @@ def normalize_id(x) -> str:
     return s
 
 
-def parse_grade(x) -> Optional[int]:
-    """Parse an Excel grade cell. None for blank; ValueError for non-numbers."""
+def parse_grade(x) -> Optional[str]:
+    """The text to type for an Excel grade cell, unchanged (no rounding).
+
+    Cells come from load_sheet already as the text Excel displays, so a
+    grade shown as 12.5 is typed as 12.5. None for blank; ValueError for
+    anything that isn't a number.
+    """
     if _is_blank(x):
         return None
-    f = float(str(x).strip())
+    s = str(x).strip()
+    f = float(s)
     if not math.isfinite(f):
         raise ValueError(f"not a number: {x!r}")
-    return round_half_up(f)
+    return s
 
 
 def looks_numeric(values, threshold: float = 0.6) -> bool:
@@ -392,11 +397,89 @@ def list_sheets(path: str) -> list[str]:
         return list(xls.sheet_names)
 
 
+def _decimals_in_format(number_format: str) -> Optional[tuple[int, int]]:
+    """(required, optional) decimal places of an Excel number format like '0.00'.
+
+    None means "General" (or a format we don't interpret): show the number
+    the way Excel's General format does.
+    """
+    fmt = (number_format or "General").split(";")[0]
+    fmt = re.sub(r'"[^"]*"|\\.|\[[^\]]*\]|_.|\*.', "", fmt)  # quoted text, escapes, colors, padding
+    if fmt.strip().lower() in ("general", "@", "") or "%" in fmt or re.search(r"[dmyhs]", fmt, re.I):
+        return None
+    m = re.search(r"[0#?,]*\.([0#?]+)|[0#?]", fmt)
+    if not m:
+        return None
+    frac = m.group(1) or ""
+    return frac.count("0"), sum(frac.count(ch) for ch in "#?")
+
+
+def excel_display_text(value, number_format: str = "General"):
+    """The text Excel shows for a cell, e.g. 13.8333 with format '0' -> '14'.
+
+    Returns None for empty cells. Rounding is half away from zero on the
+    decimal value, like Excel. Float noise such as 15.200000000000001 is
+    removed.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return str(value).upper()
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return str(value)
+        places = _decimals_in_format(number_format)
+        if places is None:
+            # General: at most ~10 significant digits, like a normal-width Excel column.
+            text = f"{value:.10g}"
+            if "e" in text:
+                text = format(Decimal(text), "f")
+        else:
+            required, optional = places
+            q = Decimal(repr(value)).quantize(Decimal(1).scaleb(-(required + optional)), rounding=ROUND_HALF_UP)
+            text = format(q, "f")
+            if optional and "." in text:
+                whole, frac = text.split(".")
+                frac = frac.rstrip("0").ljust(required, "0")
+                text = f"{whole}.{frac}" if frac else whole
+        return "0" if re.fullmatch(r"-0(\.0*)?", text) else text
+    text = str(value).strip()
+    return text or None
+
+
 def load_sheet(path: str, sheet: str) -> pd.DataFrame:
-    """Read a sheet with string column names, dropping fully empty rows/columns."""
-    df = pd.read_excel(path, sheet_name=sheet)
+    """Read a sheet as the text Excel displays, dropping fully empty rows/columns.
+
+    Values are strings exactly as shown in Excel (number formats applied),
+    so grades are copied as the teacher sees them. Column names follow
+    pandas' conventions ("Unnamed: 4", duplicate "Quiz.1").
+    """
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        ws = wb[sheet]
+        rows = [
+            [excel_display_text(c.value, getattr(c, "number_format", "General")) for c in row]
+            for row in ws.iter_rows()
+        ]
+    finally:
+        wb.close()
+
+    if not rows:
+        return pd.DataFrame()
+    width = max(len(r) for r in rows)
+    rows = [r + [None] * (width - len(r)) for r in rows]
+
+    names, seen = [], {}
+    for i, h in enumerate(rows[0]):
+        base = h if h else f"Unnamed: {i}"
+        n = seen.get(base, 0)
+        seen[base] = n + 1
+        names.append(base if n == 0 else f"{base}.{n}")
+
+    df = pd.DataFrame(rows[1:], columns=names, dtype=object)
     df = df.dropna(how="all").dropna(axis=1, how="all")
-    df.columns = [str(c).strip() for c in df.columns]
     return df.reset_index(drop=True)
 
 
@@ -405,7 +488,7 @@ def load_sheet(path: str, sheet: str) -> pd.DataFrame:
 @dataclass
 class CellWrite:
     mapping: ColumnMapping
-    value: int
+    value: str  # typed exactly, e.g. "12.5"
 
 
 @dataclass
@@ -468,7 +551,7 @@ def build_fill_plan(job: FillJob, df: pd.DataFrame, portal_ids: Optional[list[st
                 continue
             if value is None:
                 if job.blank_as_zero:
-                    value = 0
+                    value = "0"
                 else:
                     plan.blank_cells += 1
                     continue
@@ -491,7 +574,7 @@ def row_for_student(grid: GridInfo, sid: str, id_column_index: int):
     ).first
 
 
-def _cell_shows(text: str, value: int) -> bool:
+def _cell_shows(text: str, value: str) -> bool:
     text = text.strip()
     if text == "":
         return False
@@ -502,7 +585,7 @@ def _cell_shows(text: str, value: int) -> bool:
         return True
 
 
-def edit_cell_commit(page: Page, row, td_index: int, value: int, focus_index: int) -> None:
+def edit_cell_commit(page: Page, row, td_index: int, value: str, focus_index: int) -> None:
     """Double-click a DHTMLX cell, select-all, type, commit with Tab.
 
     Retries a few times since the grid is known to occasionally ignore the
@@ -526,7 +609,7 @@ def edit_cell_commit(page: Page, row, td_index: int, value: int, focus_index: in
         page.wait_for_timeout(80)
 
         page.keyboard.press(f"{modifier}+A")
-        page.keyboard.insert_text(str(int(value)))
+        page.keyboard.insert_text(str(value))
         page.keyboard.press("Tab")
         page.wait_for_timeout(150)
 
