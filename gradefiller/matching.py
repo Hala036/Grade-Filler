@@ -118,8 +118,14 @@ def grade_candidate_columns(df: pd.DataFrame, id_column: Optional[str]) -> list[
     return out
 
 
+def _is_generic(label: str) -> bool:
+    """True for the fallback names given to columns without a header ("Column 3")."""
+    return label.startswith("Column ") and label[7:].isdigit()
+
+
 def portal_fillable_columns(grid: list[GridColumn], id_index: Optional[int]) -> list[GridColumn]:
     """Portal columns that could receive grades (not the ID, not text like names)."""
+    named = any(not _is_generic(g.label) for g in grid)
     out = []
     for g in grid:
         if g.index == id_index:
@@ -127,27 +133,44 @@ def portal_fillable_columns(grid: list[GridColumn], id_index: Optional[int]) -> 
         non_blank = [v for v in g.values if v]
         if non_blank and not looks_numeric(non_blank):
             continue  # names, statuses, etc.
+        if len(non_blank) > 1 and non_blank == [str(n) for n in range(1, len(non_blank) + 1)]:
+            continue  # the portal's row-number column ("#"): 1, 2, 3 …
+        if not non_blank and _is_generic(g.label) and named:
+            continue  # unnamed and empty while others have names: a hidden spacer column
         out.append(g)
     return out
 
 
-def _norm_label(s: str) -> str:
-    s = unicodedata.normalize("NFKC", str(s)).lower()
-    s = re.sub(r"\.\d+$", "", s)       # pandas duplicate suffix: "Quiz.1"
-    s = re.sub(r"[/(]\s*\d+\s*\)?", " ", s)  # max-mark suffix: "First/25", "(25)"
+_MAX_MARK = re.compile(r"(?:[/(]\s*|\s+)(\d+)\s*\)?\s*$")  # "First/25", "First 25", "Quiz (10)"
+
+
+def _split_label(s: str) -> tuple[str, Optional[str]]:
+    """(name, max mark): "First/25" and "First 25" -> ("first", "25")."""
+    s = unicodedata.normalize("NFKC", str(s)).lower().strip()
+    s = re.sub(r"\.\d+$", "", s)  # pandas duplicate suffix: "Quiz.1"
+    mark = None
+    m = _MAX_MARK.search(s)
+    if m and s[: m.start()].strip():
+        mark, s = m.group(1), s[: m.start()]
     s = re.sub(r"[^\w]+", " ", s)
-    return " ".join(s.split())
+    return " ".join(s.split()), mark
 
 
 def _similarity(a: str, b: str) -> float:
-    a, b = _norm_label(a), _norm_label(b)
+    (a, mark_a), (b, mark_b) = _split_label(a), _split_label(b)
     if not a or not b:
         return 0.0
     if a == b:
-        return 1.0
-    if a in b.split() or b in a.split():
-        return 0.9
-    return SequenceMatcher(None, a, b).ratio()
+        score = 1.0
+    elif a in b.split() or b in a.split():
+        score = 0.9
+    else:
+        score = SequenceMatcher(None, a, b).ratio()
+    # Same name, different max mark ("First 25" vs "First/30"): still a
+    # candidate, but the one with the matching mark wins.
+    if mark_a and mark_b and mark_a != mark_b:
+        score -= 0.15
+    return score
 
 
 def suggest_grade_mappings(
@@ -156,7 +179,7 @@ def suggest_grade_mappings(
     """One-to-one (portal_index, excel_column) pairs whose names clearly match."""
     scored = []
     for g in portal_columns:
-        if g.label.startswith("Column ") and g.label[7:].isdigit():
+        if _is_generic(g.label):
             continue  # generic label, nothing to compare
         for c in excel_columns:
             s = _similarity(g.label, c)

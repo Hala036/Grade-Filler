@@ -399,14 +399,44 @@ _DISCOVER_JS = "(" + r"""
     const matrix = rows.map(r => Array.from(r.cells).map(text));
     const cols = Math.max(0, ...matrix.map(r => r.length));
 
-    let labels = null;
-    for (const ht of c.querySelectorAll('table')) {
-      if (ht === t || t.contains(ht)) continue;
-      for (const hr of Array.from(ht.rows).reverse()) {
-        const texts = Array.from(hr.cells).map(text);
-        if (texts.length === cols && texts.every(Boolean)) { labels = texts; break; }
+    // Header: possibly several rows with merged cells (the portal has
+    // "Mark" over First/Second/Third). Lay the cells out on a grid, honouring
+    // rowspan/colspan, and give each column its lowest non-empty name.
+    const headerLabels = ht => {
+      const grid = [];
+      Array.from(ht.rows).forEach((hr, r) => {
+        grid[r] = grid[r] || [];
+        let col = 0;
+        for (const cell of hr.cells) {
+          while (grid[r][col] !== undefined) col++;
+          const label = text(cell).replace(/\s+/g, ' ');
+          for (let dr = 0; dr < (cell.rowSpan || 1); dr++) {
+            grid[r + dr] = grid[r + dr] || [];
+            for (let dc = 0; dc < (cell.colSpan || 1); dc++) grid[r + dr][col + dc] = label;
+          }
+          col += cell.colSpan || 1;
+        }
+      });
+      const width = Math.max(0, ...grid.map(row => row.length));
+      const names = [];
+      for (let k = 0; k < width; k++) {
+        let name = '';
+        for (const row of grid) if (row[k]) name = row[k];
+        names.push(name);
       }
-      if (labels) break;
+      return names;
+    };
+    let labels = null;
+    const headerTables = Array.from(c.querySelectorAll('table'))
+      .filter(ht => ht !== t && !t.contains(ht) && !ht.contains(t))
+      .sort((x, y) => /\bhdr\b/.test(y.className) - /\bhdr\b/.test(x.className));
+    for (const ht of headerTables) {
+      const names = headerLabels(ht);
+      // A header row may have one extra/missing hidden column; real names must
+      // cover most of the table.
+      if (Math.abs(names.length - cols) > 1) continue;
+      const fitted = Array.from({length: cols}, (_, k) => names[k] || '');
+      if (fitted.filter(Boolean).length >= Math.min(2, cols)) { labels = fitted; break; }
     }
 
     const rect = c.getBoundingClientRect();
@@ -511,7 +541,7 @@ def scan_grid(grid: GridInfo) -> GridScan:
     columns = [
         GridColumn(
             index=i,
-            label=labels[i] if labels else f"Column {i + 1}",
+            label=(labels[i] if labels and i < len(labels) else "") or f"Column {i + 1}",
             values=col_values(i),
         )
         for i in range(grid.cols)
