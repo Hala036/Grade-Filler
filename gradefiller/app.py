@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from logging.handlers import RotatingFileHandler
 import time
 import traceback
 from typing import Optional
@@ -39,20 +40,23 @@ def _ms(since: float) -> float:
 
 
 def setup_logging() -> None:
-    """Timing/diagnostic lines go to the terminal and to GradeFiller/gradefiller.log."""
+    """Timing/diagnostic lines go only to GradeFiller/gradefiller.log, not the terminal.
+
+    The file is capped (about 1 MB, one old copy kept). To see the lines live
+    while debugging, add a logging.StreamHandler() to `log` here.
+    """
     if log.handlers:
         return
     log.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s %(message)s", "%H:%M:%S")
-    console = logging.StreamHandler()
-    console.setFormatter(fmt)
-    log.addHandler(console)
+    log.propagate = False  # never fall through to the terminal
     try:
-        file = logging.FileHandler(app_data_dir() / "gradefiller.log", encoding="utf-8")
-        file.setFormatter(fmt)
+        file = RotatingFileHandler(
+            app_data_dir() / "gradefiller.log", maxBytes=1_000_000, backupCount=1, encoding="utf-8"
+        )
+        file.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
         log.addHandler(file)
     except OSError:
-        pass  # logging must never stop the app
+        log.addHandler(logging.NullHandler())  # logging must never stop the app
 
 STEP_LOGIN, STEP_EXCEL, STEP_GRID, STEP_MAP, STEP_RUN = range(5)
 
