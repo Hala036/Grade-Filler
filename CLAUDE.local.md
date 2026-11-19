@@ -35,7 +35,6 @@ double-click `.exe` with no terminal at all.
 | `gradefiller/matching.py` | Pure auto-matching: ID pair by shared values, grade pairs by name similarity |
 | `gradefiller/playwright_worker.py` | One thread owns Playwright (sync API is thread-bound); UI submits tasks |
 | `gradefiller/paths.py` | Saved login → `%APPDATA%\GradeFiller\state.json` / `~/Library/Application Support/GradeFiller` |
-| `GUI.py`, `upload_grades.py`, `save_session.py` | **Old, obsolete** (Tkinter / hardcoded to one course). Unused. Delete once the user agrees. |
 
 ## Run it
 
@@ -58,6 +57,8 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 
 ## Recent fixes (newest first)
 
+- Deleted the obsolete `gui.py`, `upload_grades.py`, `save_session.py` (user agreed, 2026-11-19).
+
 - "Show screen changes from the browser thread right away": **The screen froze on "Looking for the grade table…" until the window lost focus.** Cause: worker callbacks updated Flet from the Playwright thread; Flet's desktop transport queues outgoing changes in an `asyncio.Queue` (`flet_socket_server.send_message` → `put_nowait`), which doesn't wake the event loop when touched from another thread, so the new screen waited for any other event (focus change) to wake it. Fix: `PlaywrightWorker(dispatch=…)` hands every `on_success`/`on_error` to `GradeFillerApp._on_ui_thread`, which runs it via `page.run_task` on Flet's loop. Fill progress (`on_progress`, called on the browser thread) goes through the same path. **Rule for agents: never update Flet controls from the worker thread or any other thread; use `_on_ui_thread`.**
 
 - **Round-up option in Match Columns (per-digit boxes).** A "Round grades up" checkbox under "Write 0 for blank cells" opens a row of 9 clickable boxes, one per first digit after the point (12.1 … 12.9). Each shows its result ("stays" / "→ 12.5" / "→ 13", grey/amber/green); a click cycles the choice. Digits .1–.4 can stay, go up to .5 or up to the next whole number; .5–.9 can stay or go up to the next whole (so no grade ever goes down). Buttons: "Use the usual rule" (.1–.4 → .5, .5+ → whole, the default) and "Set all to stays". A sentence sums it up ("12.1 stays · 12.2–12.4 → 12.5 · 12.5–12.9 → 13") here and on Review; each changed cell is listed under "Show details". Logic: `automation.RoundUp` (`rules` per digit, `allowed`, `with_next`) + `apply_round_up`, applied in `build_fill_plan` (`FillPlan.rounded`). Only the **first** decimal digit counts: 12.05 and 12.15 behave like 12.0 and 12.1. Applied to the text Excel *displays*. Replaced a first version with two number boxes (threshold/step) because the user wanted control like ".1 stays, .2–.4 → .5". Not checked in a real window yet, only with a stub page.
@@ -74,12 +75,11 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 
 - [x] **"Looking for the grade table…" is slow on the real portal** (user, 2026-11-19). **Resolved:** the search itself was fast (the user confirmed with the timing log); the screen just didn't redraw until the window lost focus. See the thread fix in Recent fixes. Original notes: It's not the ID comparison: on a portal-sized fake page (110 students × 20 columns, 4 frames) the search takes ~30 ms, ranking ~2 ms and building the screen ~20 ms. Timing logs were added to find out (since then they go only to the file, not the terminal, at the user's request; size-capped at ~1 MB): `GradeFiller/gradefiller.log` (in `%APPDATA%` on Windows, `~/Library/Application Support` on macOS) show the wait for the browser worker, ms per tab/frame (with URL; `[Mark Entry]` marks the popup), `save_session` time, and how the table was chosen ("by the 'Mark Entry' popup title" vs "by student IDs"). Next: read a real log. Suspects: a slow or still-loading frame (`frame.evaluate` has no timeout), slow `innerText` on a big portal page in `gfTitled`, or the worker still busy with an earlier browser action.
 
-- [x] **Popup detection: confirmed on the real portal** (user, 2026-11-19). All tables are found, including the popup's grade table. The "in front" ranking alone didn't settle the choice, so the user had to pick by hand; data-based auto-selection (above) now does it. Still to confirm on the real portal: that the "Mark Entry" table is picked without asking (Match Columns should say "Filling the Mark Entry table (N students)"). If it says "Filling the portal table…", title detection missed: inspect the popup's DOM (is the title text there, and is the window `position: absolute/fixed`?) and adjust `gfTitled` in `automation.py`.
+- [x] **Popup detection + Mark Entry auto-pick: confirmed on the real portal** (user, 2026-11-19). The Mark Entry table is chosen without asking.
+- [x] **Decimals:** the portal accepts values like `36.8` (user, 2026-11-19).
 - [ ] **Edit focus click on the ID cell** (replaced the old `body.click()`). Confirm edits still commit, and that clicking a row does nothing unwanted.
-- [ ] **Decimals:** does the portal accept `36.8` / `25.0`? If it only takes integers, those cells show as "couldn't be set".
-- [ ] **Header labels:** confirm portal column names are read. Otherwise the UI falls back to "Column N" with example values.
+- [ ] **Header labels are NOT read on the real portal** (user, 2026-11-19): the app says it couldn't read them and numbers the columns. Needs a look at the popup grid's header DOM (DHTMLX often puts headers in a separate `hdr` table / `div.xhdr`) to fix the label lookup in `automation.py`.
 - [ ] Merge `improving-UI` → `main` only after a successful real run.
-- [ ] Delete the obsolete `GUI.py`, `upload_grades.py`, `save_session.py` (ask first).
 - [ ] No automated tests in the repo yet. Earlier checks were throwaway scripts: fake DHTMLX pages + headless Chromium, and a stub Flet page driving each step. Worth adding under `tests/`.
 - [ ] Minor: the portal's row-number column (`#`) is offered as a fill target. When names tie, suggestions pick the left-most (`First/30` vs `First/25` in sec1).
 
