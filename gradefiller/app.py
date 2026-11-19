@@ -92,7 +92,7 @@ class GradeFillerApp:
         self.page.theme_mode = ft.ThemeMode.LIGHT
         self.page.padding = 0
 
-        self.pw = PlaywrightWorker()
+        self.pw = PlaywrightWorker(dispatch=self._on_ui_thread)
         self.session: Optional[automation.PortalSession] = None
         self.file_picker = ft.FilePicker()  # keep a reference: services are dropped otherwise
 
@@ -145,6 +145,21 @@ class GradeFillerApp:
         self._render_step()
 
     # ---------- shell ----------
+
+    def _on_ui_thread(self, callback, *args):
+        """Run callback(*args) on Flet's event loop, from any thread.
+
+        Screen changes made from the browser thread were queued but not
+        shown until something else woke Flet up (like switching windows).
+        """
+        async def run():
+            callback(*args)
+
+        try:
+            self.page.run_task(run)
+        except Exception:
+            # No running event loop (e.g. during shutdown): best effort.
+            callback(*args)
 
     def _session(self) -> automation.PortalSession:
         if self.session is None:
@@ -1019,8 +1034,12 @@ class GradeFillerApp:
             self.page.update()
 
             def on_progress(i, total, message):
-                # Runs on the Playwright worker thread; Flet 0.80+ allows
-                # updating controls from background threads.
+                # Called on the browser thread; the screen update itself is
+                # handed to Flet's loop (see _on_ui_thread), or the progress
+                # bar would only redraw when the window lost focus.
+                self._on_ui_thread(show_progress, i, total, message)
+
+            def show_progress(i, total, message):
                 progress.value = i / total if total else 0
                 progress_text.value = f"{i} of {total}"
                 log_line(message, WARN if message.startswith(("Not found", "Problem")) else None)
