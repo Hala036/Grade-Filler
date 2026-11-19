@@ -1,0 +1,1070 @@
+"""Grade Filler wizard UI (Flet).
+
+A single guided flow: log in -> pick Excel file -> open the course grid ->
+map columns (scanned live from the portal) -> review -> fill -> save.
+
+Works for any course and any number of exams: the portal's columns are
+read from the live grade table, the Excel columns from the chosen sheet,
+and the user maps as many Excel -> portal columns as they need (the app
+pre-fills the obvious ones).
+
+Playwright's sync API pins itself to whichever OS thread first calls
+sync_playwright().start() — every later call for that session must run on
+the *same* thread or Playwright raises "cannot switch to a different
+thread". Flet button clicks and dialog confirmations aren't guaranteed to
+land on the same thread as each other, so all Playwright calls are routed
+through a single PlaywrightWorker (gradefiller/playwright_worker.py) that
+owns one dedicated thread for the whole browser session's lifetime.
+"""
+from __future__ import annotations
+
+import threading
+import traceback
+from typing import Optional
+
+import flet as ft
+import pandas as pd
+
+from gradefiller import automation, matching
+from gradefiller.paths import state_path
+from gradefiller.playwright_worker import PlaywrightWorker
+
+STEP_LOGIN, STEP_EXCEL, STEP_GRID, STEP_MAP, STEP_RUN = range(5)
+
+ERROR = ft.Colors.RED_700
+OK = ft.Colors.GREEN_700
+INFO = ft.Colors.BLUE_GREY_700
+WARN = ft.Colors.ORANGE_800
+
+
+def _preview(values: list[str], limit: int = 8) -> str:
+    shown = ", ".join(values[:limit])
+    extra = len(values) - limit
+    return f"{shown} and {extra} more" if extra > 0 else shown
+
+
+def _fmt(v) -> str:
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, float):
+        return str(int(v)) if v.is_integer() else f"{v:.2f}".rstrip("0").rstrip(".")
+    return str(v).strip()
+
+
+class GradeFillerApp:
+    def __init__(self, page: ft.Page):
+        self.page = page
+        self.page.title = "Grade Filler"
+        self.page.window.width = 900
+        self.page.window.height = 720
+        self.page.window.min_width = 720
+        self.page.window.min_height = 600
+        self.page.theme_mode = ft.ThemeMode.LIGHT
+        self.page.padding = 0
+
+        self.pw = PlaywrightWorker()
+        self.session: Optional[automation.PortalSession] = None
+        self.file_picker = ft.FilePicker()  # keep a reference: services are dropped otherwise
+
+        # Step 2
+        self.excel_path: Optional[str] = None
+        self.sheets: list[str] = []
+        self.sheet_name: Optional[str] = None
+        self.df: Optional[pd.DataFrame] = None
+
+        # Step 3/4
+        self.grid: list[automation.GridColumn] = []
+        self.labels_found = True
+        self.id_portal: Optional[int] = None
+        self.id_excel: Optional[str] = None
+        self.grade_pairs: list[dict] = []  # {"excel": str|None, "portal": int|None}
+        self.blank_as_zero = False
+        self._mapping_source = None  # what the current mapping was suggested for
+
+        # Step 5
+        self.job: Optional[automation.FillJob] = None
+        self.plan: Optional[automation.FillPlan] = None
+        self._stop_requested = False
+        self._running = False
+
+        self.steps = [
+            self._build_step_login,
+            self._build_step_excel,
+            self._build_step_grid,
+            self._build_step_mapping,
+            self._build_step_run,
+        ]
+        self.step_index = STEP_LOGIN
+
+        self.page.window.prevent_close = True
+        self.page.window.on_event = self._on_window_event
+
+        self.body = ft.Container(expand=True, padding=24)
+        self.header = self._build_header()
+        self.page.add(
+            ft.Column(
+                [self.header, ft.Divider(height=1), self.body],
+                expand=True,
+                spacing=0,
+            )
+        )
+        self._render_step()
+
+    # ---------- shell ----------
+
+    def _session(self) -> automation.PortalSession:
+        if self.session is None:
+            self.session = automation.PortalSession(state_path())
+        return self.session
+
+    def _build_header(self) -> ft.Control:
+        labels = ["Log In", "Grades File", "Course Table", "Match Columns", "Review & Fill"]
+        self.step_chips = []
+        for i, label in enumerate(labels):
+            chip = ft.Container(
+                content=ft.Text(f"{i + 1}. {label}", size=12, weight=ft.FontWeight.W_500),
+                padding=ft.Padding.symmetric(horizontal=12, vertical=6),
+                border_radius=16,
+                on_click=lambda _, i=i: self._chip_clicked(i),
+            )
+            self.step_chips.append(chip)
+        return ft.Container(
+            content=ft.Row(self.step_chips, spacing=8, wrap=True),
+            padding=ft.Padding.symmetric(horizontal=24, vertical=16),
+        )
+
+    def _chip_clicked(self, index: int):
+        # Only allow jumping back to steps already done.
+        if index < self.step_index and not self._running:
+            self._go_to(index)
+
+    def _update_chips(self):
+        for i, chip in enumerate(self.step_chips):
+            if i == self.step_index:
+                chip.bgcolor = ft.Colors.BLUE_600
+                chip.content.color = ft.Colors.WHITE
+                chip.tooltip = None
+            elif i < self.step_index:
+                chip.bgcolor = ft.Colors.GREEN_100
+                chip.content.color = None
+                chip.tooltip = "Go back to this step"
+            else:
+                chip.bgcolor = ft.Colors.BLUE_GREY_50
+                chip.content.color = None
+                chip.tooltip = None
+
+    def _render_step(self):
+        self._update_chips()
+        self.body.content = self.steps[self.step_index]()
+        self.page.update()
+
+    def _go_to(self, index: int):
+        self.step_index = index
+        self._render_step()
+
+    def _step_layout(self, title: str, intro: str, controls: list, back_to: Optional[int] = None):
+        top = [ft.Text(title, size=20, weight=ft.FontWeight.BOLD)]
+        if intro:
+            top.append(ft.Text(intro, size=14))
+        top.append(ft.Container(height=8))
+        bottom = []
+        if back_to is not None:
+            bottom = [
+                ft.Container(height=8),
+                ft.TextButton("Back", icon=ft.Icons.ARROW_BACK, on_click=lambda _: self._go_to(back_to)),
+            ]
+        return ft.Column(top + controls + bottom, spacing=10, scroll=ft.ScrollMode.AUTO)
+
+    @staticmethod
+    def _set_status(text: ft.Text, message: str, color=INFO):
+        text.value = message
+        text.color = color
+
+    def _error_text(self, e: Exception) -> str:
+        msg = str(e).strip() or e.__class__.__name__
+        first = msg.splitlines()[0]
+        if "Target page, context or browser has been closed" in msg or "Browser has been closed" in msg:
+            return "The browser window was closed. Click the button again to reopen it."
+        return first
+
+    # ---------- Step 1: Login ----------
+
+    def _build_step_login(self) -> ft.Control:
+        status = ft.Text("")
+        has_saved = state_path().exists()
+
+        confirm_btn = ft.FilledButton("I've logged in — continue", icon=ft.Icons.CHECK, visible=False)
+        open_btn_cls = ft.OutlinedButton if has_saved else ft.FilledButton
+        open_btn = open_btn_cls(
+            "Log in again" if has_saved else "Open browser to log in",
+            icon=ft.Icons.LOGIN,
+        )
+
+        def open_click(_):
+            open_btn.disabled = True
+            self._set_status(status, "Opening the browser…")
+            self.page.update()
+
+            def ok(_r):
+                open_btn.disabled = False
+                confirm_btn.visible = True
+                confirm_btn.disabled = False
+                self._set_status(
+                    status,
+                    "Log in in the browser window, then come back and click “I've logged in — continue”.",
+                )
+                self.page.update()
+
+            def err(e):
+                open_btn.disabled = False
+                self._set_status(status, f"Couldn't open the browser: {self._error_text(e)}", ERROR)
+                self.page.update()
+
+            self.pw.submit(self._session().open_login, ok, err)
+
+        def confirm_click(_):
+            confirm_btn.disabled = True
+            self._set_status(status, "Saving your login…")
+            self.page.update()
+
+            def err(e):
+                confirm_btn.disabled = False
+                self._set_status(status, self._error_text(e), ERROR)
+                self.page.update()
+
+            self.pw.submit(self._session().save_session, lambda _r: self._go_to(STEP_EXCEL), err)
+
+        open_btn.on_click = open_click
+        confirm_btn.on_click = confirm_click
+
+        controls = []
+        if has_saved:
+            controls += [
+                ft.Row(
+                    [
+                        ft.Icon(ft.Icons.CHECK_CIRCLE, color=ft.Colors.GREEN_600),
+                        ft.Text("You logged in on this computer before, so you can probably skip this."),
+                    ]
+                ),
+                ft.Row(
+                    [
+                        ft.FilledButton(
+                            "Continue with saved login",
+                            icon=ft.Icons.ARROW_FORWARD,
+                            on_click=lambda _: self._go_to(STEP_EXCEL),
+                        ),
+                        open_btn,
+                    ],
+                    wrap=True,
+                ),
+                ft.Text(
+                    "If the saved login has expired, the portal will just ask you to log in again later.",
+                    size=12,
+                    color=INFO,
+                ),
+            ]
+        else:
+            controls.append(open_btn)
+        controls += [confirm_btn, status]
+
+        return self._step_layout(
+            "Step 1: Log in to the portal",
+            "This opens a browser window. Log in as usual — your login is remembered "
+            "on this computer so you won't need to do it every time.",
+            controls,
+        )
+
+    # ---------- Step 2: Excel file ----------
+
+    def _build_step_excel(self) -> ft.Control:
+        path_text = ft.Text(self.excel_path or "No file selected", italic=self.excel_path is None, expand=True)
+        status = ft.Text("")
+        sheet_dropdown = ft.Dropdown(
+            label="Sheet",
+            width=320,
+            options=[ft.dropdown.Option(s) for s in self.sheets],
+            value=self.sheet_name,
+            visible=bool(self.sheets),
+        )
+        preview_holder = ft.Column([])
+        next_btn = ft.FilledButton(
+            "Continue",
+            icon=ft.Icons.ARROW_FORWARD,
+            disabled=self.df is None or self.df.empty,
+            on_click=lambda _: self._go_to(STEP_GRID),
+        )
+
+        def show_preview():
+            df = self.df
+            if df is None:
+                preview_holder.controls = []
+                return
+            if df.empty:
+                preview_holder.controls = [ft.Text("This sheet has no data rows.", color=ERROR)]
+                return
+            head = df.head(5)
+            table = ft.DataTable(
+                columns=[ft.DataColumn(ft.Text(c, weight=ft.FontWeight.BOLD)) for c in df.columns],
+                rows=[
+                    ft.DataRow(cells=[ft.DataCell(ft.Text(_fmt(v))) for v in row])
+                    for row in head.itertuples(index=False)
+                ],
+                heading_row_height=36,
+                data_row_min_height=30,
+                data_row_max_height=30,
+                column_spacing=18,
+            )
+            preview_holder.controls = [
+                ft.Text(
+                    f"{len(df)} rows, {len(df.columns)} columns. First 5 rows:",
+                    weight=ft.FontWeight.W_500,
+                ),
+                ft.Container(
+                    content=ft.Row([table], scroll=ft.ScrollMode.AUTO),
+                    border=ft.Border.all(1, ft.Colors.BLUE_GREY_100),
+                    border_radius=8,
+                ),
+            ]
+
+        def load_sheet():
+            try:
+                self.df = automation.load_sheet(self.excel_path, self.sheet_name)
+                self._set_status(status, "")
+            except Exception as e:
+                self.df = None
+                self._set_status(status, f"Couldn't read this sheet: {self._error_text(e)}", ERROR)
+            next_btn.disabled = self.df is None or self.df.empty
+            show_preview()
+            self.page.update()
+
+        def on_sheet_select(e):
+            self.sheet_name = sheet_dropdown.value
+            load_sheet()
+
+        async def pick_file(_):
+            files = await self.file_picker.pick_files(
+                dialog_title="Choose the Excel grades file",
+                allowed_extensions=["xlsx", "xlsm"],
+                allow_multiple=False,
+            )
+            if not files:
+                return
+            path = files[0].path
+            if not path:
+                self._set_status(status, "Couldn't get the file's location. Try choosing it again.", ERROR)
+                self.page.update()
+                return
+            try:
+                sheets = automation.list_sheets(path)
+            except Exception as e:
+                self._set_status(
+                    status,
+                    f"Couldn't open this file: {self._error_text(e)}. If it's open in Excel, "
+                    "close it and try again.",
+                    ERROR,
+                )
+                self.page.update()
+                return
+            if not sheets:
+                self._set_status(status, "This file has no sheets.", ERROR)
+                self.page.update()
+                return
+
+            self.excel_path = path
+            self.sheets = sheets
+            self.sheet_name = sheets[0]
+            path_text.value = path
+            path_text.italic = False
+            sheet_dropdown.options = [ft.dropdown.Option(s) for s in sheets]
+            sheet_dropdown.value = self.sheet_name
+            sheet_dropdown.visible = True
+            load_sheet()
+
+        sheet_dropdown.on_select = on_sheet_select
+        show_preview()
+
+        return self._step_layout(
+            "Step 2: Choose your grades file",
+            "Pick the Excel file with the grades, then the sheet for this section. "
+            "The first row of the sheet should be the column names.",
+            [
+                ft.Row(
+                    [
+                        ft.FilledButton(
+                            "Choose Excel file…" if not self.excel_path else "Choose a different file…",
+                            icon=ft.Icons.UPLOAD_FILE,
+                            on_click=pick_file,
+                        ),
+                        path_text,
+                    ]
+                ),
+                sheet_dropdown,
+                status,
+                preview_holder,
+                ft.Container(height=8),
+                next_btn,
+            ],
+            back_to=STEP_LOGIN,
+        )
+
+    # ---------- Step 3: Open the course grade table ----------
+
+    def _build_step_grid(self) -> ft.Control:
+        status = ft.Text("")
+        open_btn = ft.OutlinedButton("Open the course list in the browser", icon=ft.Icons.OPEN_IN_BROWSER)
+        ready_btn = ft.FilledButton("The grade table is showing — continue", icon=ft.Icons.ARROW_FORWARD)
+
+        def open_click(_):
+            open_btn.disabled = True
+            self._set_status(status, "Opening…")
+            self.page.update()
+
+            def ok(_r):
+                open_btn.disabled = False
+                self._set_status(
+                    status,
+                    "Now click through to the course, section and grade table in the browser. "
+                    "If the portal asks you to log in, do that first.",
+                )
+                self.page.update()
+
+            def err(e):
+                open_btn.disabled = False
+                self._set_status(status, f"Couldn't open the portal: {self._error_text(e)}", ERROR)
+                self.page.update()
+
+            self.pw.submit(self._session().open_course_list, ok, err)
+
+        def ready_click(_):
+            ready_btn.disabled = True
+            open_btn.disabled = True
+            self._set_status(status, "Looking for the grade table…")
+            self.page.update()
+            self._scan(
+                on_done=lambda: self._go_to(STEP_MAP),
+                on_fail=lambda msg: (
+                    setattr(ready_btn, "disabled", False),
+                    setattr(open_btn, "disabled", False),
+                    self._set_status(status, msg, ERROR),
+                    self.page.update(),
+                ),
+            )
+
+        open_btn.on_click = open_click
+        ready_btn.on_click = ready_click
+
+        return self._step_layout(
+            "Step 3: Open the grade table",
+            "In the browser, go to the exact course, section and grade table you want to "
+            "fill (every course's table is different, so this part is up to you). "
+            "Then come back here.",
+            [ft.Row([open_btn, ready_btn], wrap=True), status],
+            back_to=STEP_EXCEL,
+        )
+
+    def _scan(self, on_done, on_fail):
+        """Find the grade table in the browser and read its columns."""
+
+        def task():
+            session = self._session()
+            if not session.find_grid_page(timeout_ms=5000):
+                return None
+            scan = automation.scan_grid(session.page)
+            try:
+                session.save_session()  # keep the saved login fresh
+            except Exception:
+                pass
+            return scan
+
+        def ok(scan):
+            if scan is None:
+                on_fail(
+                    "Couldn't find a student grade table in the browser. Make sure it's open "
+                    "and shows the students, then try again."
+                )
+                return
+            if not scan.columns:
+                on_fail("The grade table seems to be empty (no students). Open a table with students.")
+                return
+            self.grid = scan.columns
+            self.labels_found = scan.labels_found
+            on_done()
+
+        def err(e):
+            on_fail(f"Couldn't read the grade table: {self._error_text(e)}")
+
+        self.pw.submit(task, ok, err)
+
+    # ---------- Step 4: Column mapping ----------
+
+    def _grid_col(self, index: Optional[int]) -> Optional[automation.GridColumn]:
+        return next((g for g in self.grid if g.index == index), None)
+
+    def _suggest_mapping(self):
+        """Pre-fill ID and grade pairs. Only when file/sheet/table changed."""
+        source = (self.excel_path, self.sheet_name, tuple(g.label for g in self.grid), len(self.grid))
+        if source == self._mapping_source:
+            # Same data: keep the user's choices, just drop ones that no longer exist.
+            self._prune_mapping()
+            return
+        self._mapping_source = source
+
+        p, e, n = matching.detect_id_columns(self.grid, self.df)
+        self.id_portal, self.id_excel = (p, e) if n > 0 else (None, None)
+
+        portal_cols = matching.portal_fillable_columns(self.grid, self.id_portal)
+        excel_cols = matching.grade_candidate_columns(self.df, self.id_excel)
+        pairs = matching.suggest_grade_mappings(portal_cols, excel_cols)
+        self.grade_pairs = [{"portal": pi, "excel": ec} for pi, ec in pairs] or [{"portal": None, "excel": None}]
+
+    def _prune_mapping(self):
+        indexes = {g.index for g in self.grid}
+        cols = set(self.df.columns)
+        if self.id_portal not in indexes:
+            self.id_portal = None
+        if self.id_excel not in cols:
+            self.id_excel = None
+        for pair in self.grade_pairs:
+            if pair["portal"] not in indexes:
+                pair["portal"] = None
+            if pair["excel"] not in cols:
+                pair["excel"] = None
+
+    def _mapping_problems(self) -> tuple[list[str], dict[int, str]]:
+        """(general problems, per-row problems by row number)."""
+        general, per_row = [], {}
+        if self.id_portal is None or self.id_excel is None:
+            general.append("Choose the Student ID column on both sides.")
+
+        seen_portal: dict[int, int] = {}
+        any_complete = False
+        for n, pair in enumerate(self.grade_pairs):
+            p, e = pair["portal"], pair["excel"]
+            if p is None and e is None:
+                continue
+            if p is None or e is None:
+                per_row[n] = "Choose both columns, or remove this row."
+                continue
+            if p == self.id_portal:
+                per_row[n] = "That's the Student ID column — it can't be filled."
+                continue
+            if p in seen_portal:
+                per_row[n] = f"This portal column is already used in row {seen_portal[p] + 1}."
+                continue
+            seen_portal[p] = n
+            any_complete = True
+        if not any_complete and not per_row:
+            general.append("Add at least one grade column to fill.")
+        return general, per_row
+
+    def _build_step_mapping(self) -> ft.Control:
+        self._suggest_mapping()
+        holder = ft.Column([], spacing=10)
+        status = ft.Text("")
+
+        def portal_option(g: automation.GridColumn) -> ft.dropdown.Option:
+            sample = g.sample_value
+            hint = f"  (now: {sample})" if sample else "  (empty)"
+            return ft.dropdown.Option(key=str(g.index), text=f"{g.label}{hint}")
+
+        def excel_option(col: str) -> ft.dropdown.Option:
+            sample = next((_fmt(v) for v in self.df[col] if _fmt(v)), "")
+            return ft.dropdown.Option(key=col, text=f"{col}  (e.g. {sample})" if sample else col)
+
+        def render():
+            general, per_row = self._mapping_problems()
+
+            # --- Student ID card ---
+            id_portal_dd = ft.Dropdown(
+                label="Student ID column in the portal",
+                options=[portal_option(g) for g in self.grid],
+                value=str(self.id_portal) if self.id_portal is not None else None,
+                expand=True,
+            )
+            id_excel_dd = ft.Dropdown(
+                label="Student ID column in Excel",
+                options=[excel_option(c) for c in self.df.columns],
+                value=self.id_excel,
+                expand=True,
+            )
+
+            def on_id_portal(e):
+                self.id_portal = int(e.control.value) if e.control.value is not None else None
+                render()
+
+            def on_id_excel(e):
+                self.id_excel = e.control.value
+                render()
+
+            id_portal_dd.on_select = on_id_portal
+            id_excel_dd.on_select = on_id_excel
+
+            id_check = ft.Text("", size=13)
+            if self.id_portal is not None and self.id_excel is not None:
+                found, total = matching.id_overlap(self._grid_col(self.id_portal), self.df, self.id_excel)
+                if total and found == total:
+                    self._set_status(id_check, f"✓ All {total} students in the portal table are in this Excel column.", OK)
+                elif found:
+                    self._set_status(
+                        id_check,
+                        f"✓ {found} of {total} students in the portal table were found in this Excel column.",
+                        OK,
+                    )
+                else:
+                    self._set_status(
+                        id_check,
+                        "None of the portal's student IDs appear in this Excel column — "
+                        "check that both dropdowns are the ID columns, and that this is the right sheet.",
+                        ERROR,
+                    )
+
+            id_card = self._card(
+                "1. How to find each student",
+                [ft.Row([id_portal_dd, id_excel_dd], spacing=12), id_check],
+            )
+
+            # --- Grade rows card ---
+            portal_choices = matching.portal_fillable_columns(self.grid, self.id_portal)
+            # Keep currently chosen portal columns selectable even if filtered.
+            chosen = {p["portal"] for p in self.grade_pairs if p["portal"] is not None}
+            portal_choices += [g for g in self.grid if g.index in chosen and g not in portal_choices]
+            portal_choices.sort(key=lambda g: g.index)
+
+            excel_choices = matching.grade_candidate_columns(self.df, self.id_excel)
+            chosen_e = [p["excel"] for p in self.grade_pairs if p["excel"] and p["excel"] not in excel_choices]
+            excel_choices = [c for c in self.df.columns if c in set(excel_choices) | set(chosen_e)]
+
+            rows = []
+            for n, pair in enumerate(self.grade_pairs):
+                excel_dd = ft.Dropdown(
+                    label="Take grades from (Excel)",
+                    options=[excel_option(c) for c in excel_choices],
+                    value=pair["excel"],
+                    expand=True,
+                )
+                portal_dd = ft.Dropdown(
+                    label="Write them into (portal)",
+                    options=[portal_option(g) for g in portal_choices],
+                    value=str(pair["portal"]) if pair["portal"] is not None else None,
+                    expand=True,
+                )
+
+                def on_excel(e, pair=pair):
+                    pair["excel"] = e.control.value
+                    render()
+
+                def on_portal(e, pair=pair):
+                    pair["portal"] = int(e.control.value) if e.control.value is not None else None
+                    render()
+
+                def remove(_, n=n):
+                    del self.grade_pairs[n]
+                    if not self.grade_pairs:
+                        self.grade_pairs.append({"portal": None, "excel": None})
+                    render()
+
+                excel_dd.on_select = on_excel
+                portal_dd.on_select = on_portal
+                row_controls = [
+                    ft.Row(
+                        [
+                            excel_dd,
+                            ft.Icon(ft.Icons.ARROW_FORWARD, color=ft.Colors.BLUE_GREY_400),
+                            portal_dd,
+                            ft.IconButton(ft.Icons.DELETE_OUTLINE, tooltip="Remove this row", on_click=remove),
+                        ],
+                        spacing=8,
+                    )
+                ]
+                if n in per_row:
+                    row_controls.append(ft.Text(per_row[n], color=ERROR, size=12))
+                rows.append(ft.Column(row_controls, spacing=2))
+
+            def add_row(_):
+                self.grade_pairs.append({"portal": None, "excel": None})
+                render()
+
+            blank_cb = ft.Checkbox(
+                label="Write 0 when an Excel cell is blank (otherwise blank cells are left unchanged in the portal)",
+                value=self.blank_as_zero,
+            )
+
+            def on_blank(e):
+                self.blank_as_zero = bool(e.control.value)
+
+            blank_cb.on_change = on_blank
+
+            filled = sum(1 for p in self.grade_pairs if p["portal"] is not None and p["excel"])
+            grades_card = self._card(
+                "2. Which grades to fill",
+                [
+                    ft.Text(
+                        "Add one row per exam/column you want to fill — one, three, or as many as you need. "
+                        + ("Rows with matching names were filled in for you; please check them."
+                           if filled else "No column names matched automatically, so pick them yourself."),
+                        size=13,
+                        color=INFO,
+                    ),
+                    *rows,
+                    ft.TextButton("Add another column", icon=ft.Icons.ADD, on_click=add_row),
+                    blank_cb,
+                ],
+            )
+
+            notices = []
+            if not self.labels_found:
+                notices.append(
+                    self._notice(
+                        "The portal's column names couldn't be read, so portal columns are shown by "
+                        "position (Column 1 is the leftmost) with the value currently in them.",
+                    )
+                )
+
+            def rescan(_):
+                rescan_btn.disabled = True
+                self._set_status(status, "Reading the grade table again…")
+                self.page.update()
+
+                def fail(msg):
+                    rescan_btn.disabled = False
+                    self._set_status(status, msg, ERROR)
+                    self.page.update()
+
+                self._scan(on_done=lambda: (self._set_status(status, ""), self._go_to(STEP_MAP)), on_fail=fail)
+
+            rescan_btn = ft.TextButton(
+                "I opened a different table — read it again",
+                icon=ft.Icons.REFRESH,
+                on_click=rescan,
+            )
+
+            def go_next(_):
+                general_now, per_row_now = self._mapping_problems()
+                if general_now or per_row_now:
+                    self._set_status(status, " ".join(general_now) or "Fix the rows marked in red above.", ERROR)
+                    self.page.update()
+                    return
+                self._build_job_and_plan()
+                self._go_to(STEP_RUN)
+
+            holder.controls = notices + [
+                id_card,
+                grades_card,
+                ft.Row([rescan_btn]),
+                status,
+                ft.FilledButton("Review", icon=ft.Icons.ARROW_FORWARD, on_click=go_next),
+            ]
+            self.page.update()
+
+        render()
+        return self._step_layout(
+            "Step 4: Match the Excel columns to the portal",
+            "Each dropdown shows an example value so you can tell the columns apart.",
+            [holder],
+            back_to=STEP_GRID,
+        )
+
+    def _build_job_and_plan(self):
+        idg = self._grid_col(self.id_portal)
+        mappings = []
+        for pair in self.grade_pairs:
+            if pair["portal"] is None or not pair["excel"]:
+                continue
+            g = self._grid_col(pair["portal"])
+            mappings.append(automation.ColumnMapping(g.index, g.label, pair["excel"]))
+
+        self.job = automation.FillJob(
+            excel_path=self.excel_path,
+            sheet_name=self.sheet_name,
+            id_mapping=automation.ColumnMapping(idg.index, idg.label, self.id_excel),
+            grade_mappings=mappings,
+            blank_as_zero=self.blank_as_zero,
+        )
+        self.plan = automation.build_fill_plan(self.job, self.df, portal_ids=idg.values)
+
+    # ---------- Step 5: Review, fill & save ----------
+
+    def _build_step_run(self) -> ft.Control:
+        job, plan = self.job, self.plan
+
+        summary = [
+            self._fact(
+                ft.Icons.EDIT_NOTE,
+                f"{len(plan.students)} students will be updated "
+                f"({plan.cell_count} grade cells in: {', '.join(m.portal_label for m in job.grade_mappings)}).",
+                OK if plan.students else ERROR,
+            )
+        ]
+        if plan.blank_cells:
+            summary.append(self._fact(ft.Icons.REMOVE, f"{plan.blank_cells} blank Excel cells will be left unchanged."))
+        if plan.not_in_portal:
+            summary.append(
+                self._fact(
+                    ft.Icons.WARNING_AMBER,
+                    f"{len(plan.not_in_portal)} students in Excel aren't in this portal table (skipped): "
+                    f"{_preview(plan.not_in_portal)}",
+                    WARN,
+                )
+            )
+        if plan.missing_from_excel:
+            summary.append(
+                self._fact(
+                    ft.Icons.WARNING_AMBER,
+                    f"{len(plan.missing_from_excel)} students in the portal have no row in Excel (left unchanged): "
+                    f"{_preview(plan.missing_from_excel)}",
+                    WARN,
+                )
+            )
+        if plan.duplicate_ids:
+            summary.append(
+                self._fact(
+                    ft.Icons.WARNING_AMBER,
+                    f"These IDs appear more than once in Excel, so they're skipped: {_preview(plan.duplicate_ids)}",
+                    WARN,
+                )
+            )
+        if plan.invalid_cells:
+            summary.append(
+                self._fact(
+                    ft.Icons.WARNING_AMBER,
+                    f"{len(plan.invalid_cells)} cells aren't numbers and are skipped: {_preview(plan.invalid_cells, 3)}",
+                    WARN,
+                )
+            )
+        if plan.rows_without_id:
+            summary.append(self._fact(ft.Icons.REMOVE, f"{plan.rows_without_id} Excel rows have no student ID (ignored)."))
+
+        preview_rows = plan.students[:5]
+        preview = ft.DataTable(
+            columns=[ft.DataColumn(ft.Text("Student ID", weight=ft.FontWeight.BOLD))]
+            + [ft.DataColumn(ft.Text(m.portal_label, weight=ft.FontWeight.BOLD)) for m in job.grade_mappings],
+            rows=[
+                ft.DataRow(
+                    cells=[ft.DataCell(ft.Text(s.sid))]
+                    + [
+                        ft.DataCell(
+                            ft.Text(
+                                next((str(w.value) for w in s.writes if w.mapping.portal_index == m.portal_index),
+                                     "— unchanged")
+                            )
+                        )
+                        for m in job.grade_mappings
+                    ]
+                )
+                for s in preview_rows
+            ],
+            heading_row_height=36,
+            data_row_min_height=30,
+            data_row_max_height=30,
+        )
+
+        progress = ft.ProgressBar(value=0)
+        progress_text = ft.Text("")
+        log = ft.ListView(height=200, spacing=2, auto_scroll=True)
+        result_box = ft.Column([], spacing=6)
+        start_btn = ft.FilledButton("Start filling", icon=ft.Icons.PLAY_ARROW, disabled=not plan.students)
+        stop_btn = ft.OutlinedButton("Stop", icon=ft.Icons.STOP, disabled=True)
+        back_btn = ft.TextButton("Back to column matching", icon=ft.Icons.ARROW_BACK,
+                                 on_click=lambda _: self._go_to(STEP_MAP))
+        finish_btn = ft.FilledButton(
+            "I clicked Save in the portal — close the browser",
+            icon=ft.Icons.CHECK,
+            visible=False,
+        )
+
+        def log_line(text: str, color=None):
+            log.controls.append(ft.Text(text, size=12, font_family="monospace", color=color, selectable=True))
+
+        def set_running(running: bool):
+            self._running = running
+            start_btn.disabled = running
+            stop_btn.disabled = not running
+            back_btn.disabled = running
+
+        def on_start(_):
+            self._stop_requested = False
+            set_running(True)
+            result_box.controls = []
+            log.controls = []
+            progress.value = 0
+            progress_text.value = "Starting…"
+            self.page.update()
+
+            def on_progress(i, total, message):
+                # Runs on the Playwright worker thread; Flet 0.80+ allows
+                # updating controls from background threads.
+                progress.value = i / total if total else 0
+                progress_text.value = f"{i} of {total}"
+                log_line(message, WARN if message.startswith(("Not found", "Problem")) else None)
+                self.page.update()
+
+            def do_run():
+                return automation.run_fill(
+                    self._session(), job, plan,
+                    on_progress=on_progress,
+                    should_stop=lambda: self._stop_requested,
+                )
+
+            def on_done(result: automation.FillResult):
+                set_running(False)
+                show_result(result)
+                if result.stopped:
+                    progress_text.value = "Stopped. Press Start to run again from the beginning."
+                else:
+                    progress_text.value = "Finished typing the grades."
+                    start_btn.content = "Fill again"
+                finish_btn.visible = True
+                self.page.update()
+
+            def on_error(e):
+                set_running(False)
+                progress_text.value = "Stopped because of an error."
+                result_box.controls = [ft.Text(self._error_text(e), color=ERROR)]
+                log_line("".join(traceback.format_exception(e)), ERROR)
+                self.page.update()
+
+            self.pw.submit(do_run, on_done, on_error)
+
+        def show_result(result: automation.FillResult):
+            items = [self._fact(ft.Icons.CHECK_CIRCLE, f"{result.updated} students updated.", OK)]
+            if result.not_found:
+                items.append(self._fact(ft.Icons.WARNING_AMBER,
+                                        f"Not found in the table: {_preview(result.not_found)}", WARN))
+            if result.failed:
+                items.append(self._fact(ft.Icons.ERROR_OUTLINE,
+                                        f"{len(result.failed)} cells couldn't be set — check them by hand:", ERROR))
+                items += [ft.Text(f"   • {f}", size=12, selectable=True) for f in result.failed[:20]]
+                if len(result.failed) > 20:
+                    items.append(ft.Text(f"   … and {len(result.failed) - 20} more (see log).", size=12))
+            items.append(
+                self._notice(
+                    "Nothing is saved yet. Check the grades in the browser, then click the portal's own "
+                    "Save button. Need to fill another column in this table? Go back to column matching."
+                )
+            )
+            result_box.controls = items
+
+        def on_stop(_):
+            self._stop_requested = True
+            stop_btn.disabled = True
+            progress_text.value = "Stopping after the current student…"
+            self.page.update()
+
+        def on_finish(_):
+            finish_btn.disabled = True
+            self.page.update()
+
+            def save_and_close():
+                session = self._session()
+                try:
+                    session.save_session()
+                finally:
+                    session.close()
+
+            def done(_r):
+                self._show_message("All done", "The browser was closed. You can close this window now.")
+
+            def failed(e):
+                self._show_message("All done", "The browser was closed. You can close this window now.")
+
+            self.pw.submit(save_and_close, done, failed)
+
+        start_btn.on_click = on_start
+        stop_btn.on_click = on_stop
+        finish_btn.on_click = on_finish
+
+        return self._step_layout(
+            "Step 5: Review and fill",
+            "Check the summary below. Filling types the grades into the portal table; "
+            "nothing is saved until you click Save in the portal yourself.",
+            [
+                self._card("What will happen", summary),
+                self._card(
+                    f"Preview (first {len(preview_rows)} of {len(plan.students)} students)",
+                    [ft.Row([preview], scroll=ft.ScrollMode.AUTO)],
+                ) if preview_rows else ft.Container(),
+                ft.Row([start_btn, stop_btn], wrap=True),
+                progress,
+                progress_text,
+                ft.Container(content=log, bgcolor=ft.Colors.BLUE_GREY_50, padding=8, border_radius=8),
+                result_box,
+                finish_btn,
+                back_btn,
+            ],
+        )
+
+    # ---------- small UI helpers ----------
+
+    @staticmethod
+    def _card(title: str, controls: list) -> ft.Control:
+        return ft.Container(
+            content=ft.Column(
+                [ft.Text(title, weight=ft.FontWeight.BOLD, size=15)] + controls,
+                spacing=8,
+            ),
+            padding=16,
+            border=ft.Border.all(1, ft.Colors.BLUE_GREY_100),
+            border_radius=10,
+        )
+
+    @staticmethod
+    def _notice(text: str) -> ft.Control:
+        return ft.Container(
+            content=ft.Row(
+                [ft.Icon(ft.Icons.INFO_OUTLINE, color=ft.Colors.BLUE_700), ft.Text(text, expand=True, size=13)],
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            ),
+            bgcolor=ft.Colors.BLUE_50,
+            padding=12,
+            border_radius=8,
+        )
+
+    @staticmethod
+    def _fact(icon, text: str, color=INFO) -> ft.Control:
+        return ft.Row(
+            [ft.Icon(icon, color=color, size=18), ft.Text(text, expand=True, selectable=True)],
+            vertical_alignment=ft.CrossAxisAlignment.START,
+        )
+
+    def _show_message(self, title: str, message: str):
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(title),
+            content=ft.Text(message),
+            actions=[ft.TextButton("OK", on_click=lambda _: self.page.pop_dialog())],
+        )
+        self.page.show_dialog(dlg)
+
+    # ---------- shutdown ----------
+
+    def _on_window_event(self, e):
+        if e.type != ft.WindowEventType.CLOSE:
+            return
+        self._stop_requested = True
+        closed = threading.Event()
+
+        def destroy(*_):
+            if not closed.is_set():
+                closed.set()
+                self.page.run_task(self.page.window.destroy)
+
+        def close_browser():
+            if self.session:
+                self.session.close()
+
+        self.pw.submit(close_browser, destroy, destroy)
+        # Don't hang forever if the worker is stuck mid-action.
+        threading.Timer(6.0, destroy).start()
+
+
+def main(page: ft.Page):
+    GradeFillerApp(page)
+
+
+if __name__ == "__main__":
+    ft.run(main)
