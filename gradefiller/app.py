@@ -73,6 +73,24 @@ def _preview(values: list[str], limit: int = 8) -> str:
     return f"{shown} and {extra} more" if extra > 0 else shown
 
 
+def _style_picker(dd: ft.Dropdown) -> ft.Dropdown:
+    """Make an empty dropdown look unfinished: a faded, italic label and a
+    light border. Once something is chosen, the label and border go dark."""
+    chosen = dd.value is not None
+    dd.label_style = ft.TextStyle(
+        color=ft.Colors.BLUE_GREY_700 if chosen else ft.Colors.with_opacity(0.55, ft.Colors.BLUE_GREY_400),
+        italic=not chosen,
+    )
+    dd.border_color = ft.Colors.BLUE_GREY_400 if chosen else ft.Colors.BLUE_GREY_100
+    dd.text_style = ft.TextStyle(color=ft.Colors.BLUE_GREY_900, weight=ft.FontWeight.W_500)
+    return dd
+
+
+def _picker(**kwargs) -> ft.Dropdown:
+    """A dropdown styled by whether a value is chosen yet (see _style_picker)."""
+    return _style_picker(ft.Dropdown(**kwargs))
+
+
 def _fmt(v) -> str:
     if v is None:
         return ""
@@ -335,7 +353,7 @@ class GradeFillerApp:
     def _build_step_excel(self) -> ft.Control:
         path_text = ft.Text(self.excel_path or "No file selected", italic=self.excel_path is None, expand=True)
         status = ft.Text("")
-        sheet_dropdown = ft.Dropdown(
+        sheet_dropdown = _picker(
             label="Sheet",
             width=320,
             options=[ft.dropdown.Option(s) for s in self.sheets],
@@ -395,6 +413,7 @@ class GradeFillerApp:
 
         def on_sheet_select(e):
             self.sheet_name = sheet_dropdown.value
+            _style_picker(sheet_dropdown)
             load_sheet()
 
         async def pick_file(_):
@@ -698,13 +717,13 @@ class GradeFillerApp:
             general, per_row = self._mapping_problems()
 
             # --- Student ID card ---
-            id_portal_dd = ft.Dropdown(
+            id_portal_dd = _picker(
                 label="Student ID column in the portal",
                 options=[portal_option(g) for g in self.grid],
                 value=str(self.id_portal) if self.id_portal is not None else None,
                 expand=True,
             )
-            id_excel_dd = ft.Dropdown(
+            id_excel_dd = _picker(
                 label="Student ID column in Excel",
                 options=[excel_option(c) for c in self.df.columns],
                 value=self.id_excel,
@@ -773,13 +792,13 @@ class GradeFillerApp:
 
             rows = []
             for n, pair in enumerate(self.grade_pairs):
-                excel_dd = ft.Dropdown(
+                excel_dd = _picker(
                     label="Take grades from (Excel)",
                     options=[excel_option(c) for c in excel_choices],
                     value=pair["excel"],
                     expand=True,
                 )
-                portal_dd = ft.Dropdown(
+                portal_dd = _picker(
                     label="Write them into (portal)",
                     options=[portal_option(g) for g in portal_choices],
                     value=str(pair["portal"]) if pair["portal"] is not None else None,
@@ -901,7 +920,7 @@ class GradeFillerApp:
                 render()
 
             if len(self.grid_choices) > 1 and self._show_table_picker:
-                table_dd = ft.Dropdown(
+                table_dd = _picker(
                     label="Table to fill",
                     options=[
                         ft.dropdown.Option(key=g.key, text=f"Table {n + 1} · {g.describe()}")

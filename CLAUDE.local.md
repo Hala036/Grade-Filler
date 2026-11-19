@@ -57,6 +57,8 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 
 ## Recent fixes (newest first)
 
+- **Empty dropdowns look unfinished.** Every dropdown goes through `app._picker` / `_style_picker`: when nothing is chosen the label is faded (55% blue-grey), italic, with a light border; once chosen, label and border go dark and the value is semi-bold. Asked by the user because set and unset selectors looked alike.
+
 - **Quieter column dropdowns.** Example values in brackets ("(now: 14)", "(e.g. 12)") now appear only for columns without a real name (portal "Column N", Excel "Unnamed: N"); named columns show just the name (user found it overwhelming once names were read). The Review step's 5-student preview is the sanity check. `matching.is_generic_label`.
 
 - Deleted the obsolete `gui.py`, `upload_grades.py`, `save_session.py` (user agreed, 2026-11-19).
