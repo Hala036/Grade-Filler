@@ -29,7 +29,10 @@ double-click `.exe` with no terminal at all.
 
 | File | Role |
 |---|---|
-| `main.py` | Launcher: `python main.py` |
+| `main.py` | Launcher: `python main.py`; `--self-test` checks a build without opening the app |
+| `assets/icon.png`, `assets/icon.ico` | App icon (user's red circled "A+"). `.ico` holds 16–256 px; 16–48 px have thickened strokes so they stay readable. Used for the `.exe` (`--icon`) and the window (`page.window.icon`, Windows only), bundled via `--add-data` and found with `paths.resource_path` |
+| `gradefiller/selftest.py` | Self-test: imports, Playwright driver, headless Edge/Chrome; writes `selftest.txt`, exit 0 = pass |
+| `.github/workflows/build-windows.yml` | Builds `GradeFiller.exe` on GitHub (Windows): manual run → Artifacts; tag `v*` → Release |
 | `gradefiller/app.py` | Flet wizard, 5 steps: Log In → Grades File → Course Table → Match Columns → Review & Fill |
 | `gradefiller/automation.py` | All browser + Excel work: `PortalSession`, grid discovery (`find_grids`, `GridInfo`), `scan_grid`, `load_sheet` / `excel_display_text`, `build_fill_plan`, `run_fill`, `edit_cell_commit` |
 | `gradefiller/matching.py` | Pure auto-matching: ID pair by shared values, grade pairs by name similarity |
@@ -41,7 +44,7 @@ double-click `.exe` with no terminal at all.
 ```
 python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt     # macOS: .venv/bin/python
-.venv\Scripts\python -m playwright install chromium
+.venv\Scripts\python -m playwright install chromium   # optional: only if neither Edge nor Chrome is installed
 .venv\Scripts\python main.py
 ```
 On Windows, skip `activate` (script execution policy errors). Call `.venv\Scripts\python` directly.
@@ -56,6 +59,12 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 - **Optional round-up (off by default)** is the one exception to "no rounding". It goes by the first digit after the point, chosen per digit. The teacher's usual rule: .1–.4 up to .5, .5–.9 up to the next whole number (12.2 → 12.5, 12.5 → 13, 12 stays 12). Rounding must never lower a grade.
 
 ## Recent fixes (newest first)
+
+- **App icon** (branch `windows-exe`): the user's A+ image, cropped and turned into `assets/icon.ico`; set on the `.exe` and the app window; the self-test fails if it isn't bundled. **Tested on the Windows computer (2026-11-20): everything works**; the icon showed in the taskbar but not on the desktop. Checked: the icon *is* embedded in the `.exe` (all 7 sizes extracted from the build). Cause: Windows' icon cache remembered the first, icon-less `GradeFiller.exe`. Fix: rename the file, or Win+R → `ie4uinit.exe -show`, or restart. A fresh laptop isn't affected.
+
+- **GitHub build for the `.exe`** (branch `windows-exe`). `build-windows.yml` on `windows-latest`, Python 3.12: installs `requirements.txt` + `pyinstaller`, `flet pack main.py --name GradeFiller` (single file, no console), then runs `GradeFiller.exe --self-test` and fails unless Edge started from inside the bundle. Manual "Run workflow" (once on `main`) or any PR into `main` → download from the run's Artifacts; pushing tag `vX.Y.Z` also creates a Release, so the newest is always at `releases/latest/download/GradeFiller.exe`.
+
+- **Uses the installed browser** (branch `windows-exe`). `PortalSession._launch_browser` tries `BROWSER_CHANNELS = ("msedge", "chrome", None)`: Edge (always on Windows), then Chrome (the user's Mac), then Playwright's downloaded Chromium. None found → "Couldn't open a web browser. Please install Microsoft Edge or Google Chrome and try again." Tested on the Mac (Edge missing → Chrome 157). Not yet tested with Edge on Windows. Each run is a clean browser profile; the login lives in the app's `state.json`.
 
 - **Empty dropdowns look unfinished.** Every dropdown goes through `app._picker` / `_style_picker`: when nothing is chosen the label is faded (55% blue-grey), italic, with a light border; once chosen, label and border go dark and the value is semi-bold. Asked by the user because set and unset selectors looked alike.
 
@@ -89,8 +98,8 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 
 ## Next features
 
-1. **Windows `.exe`, no terminal (top priority).** Plan: GitHub Actions on `windows-latest` builds a single file (`flet pack`, which wraps PyInstaller) from `main.py`, uploaded as a build artifact/release. Saved login already lives in `%APPDATA%`. Expect a SmartScreen "More info → Run anyway" on first launch (unsigned). Needs the user's go-ahead before pushing a workflow.
-   - **Don't bundle Chromium; use the installed Edge.** Today the app drives Playwright's own downloaded Chromium (`playwright install chromium`, ~150 MB in a user cache folder). Packing that into the `.exe` makes it huge, and Playwright's browser-path lookup breaks inside PyInstaller's temp extraction. Instead launch with `chromium.launch(channel="msedge")` (Edge ships with every Windows install), falling back to `channel="chrome"`, then to the downloaded Chromium for dev machines. Change is in `PortalSession._ensure_browser`. Small risk: a future auto-updated Edge could outrun the pinned Playwright, in which case bump `playwright` in `requirements.txt` and rebuild.
+1. **Windows `.exe`, no terminal (top priority).** Plan: GitHub Actions on `windows-latest` builds a single file (`flet pack`, which wraps PyInstaller) from `main.py`, uploaded as a build artifact/release. Saved login already lives in `%APPDATA%`. Expect a SmartScreen "More info → Run anyway" on first launch (unsigned). Needs the user's go-ahead before pushing a workflow. The `.exe` is never built by hand or committed: pushing a tag like `v1.0.0` builds it on GitHub and attaches it to a Release (user agreed, 2026-11-20).
+   - Done: the installed Edge/Chrome is used (see Recent fixes), so nothing browser-related is bundled. Small risk: a future auto-updated Edge could outrun the pinned Playwright, in which case bump `playwright` in `requirements.txt` and rebuild.
 2. Whatever the user asks for next. Add it here.
    - Possible: remember the round-up setting between runs (today it resets each launch).
    - The local sample sheet `2251-1214311-sec1-Grades.xlsx` (gitignored) was removed from the folder on 2026-11-20; tests since then use made-up data.

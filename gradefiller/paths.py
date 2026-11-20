@@ -23,3 +23,13 @@ def app_data_dir() -> Path:
 
 def state_path() -> Path:
     return app_data_dir() / "state.json"
+
+
+def resource_path(relative: str) -> Path:
+    """A file shipped with the app (e.g. "assets/icon.ico").
+
+    From source it's relative to the project folder; inside the packed .exe,
+    PyInstaller unpacks bundled files to sys._MEIPASS.
+    """
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+    return base / relative

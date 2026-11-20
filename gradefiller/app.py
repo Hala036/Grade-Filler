@@ -30,7 +30,7 @@ import pandas as pd
 
 from gradefiller import automation, matching
 from gradefiller.round_line import RoundLine, tenth_label
-from gradefiller.paths import app_data_dir, state_path
+from gradefiller.paths import app_data_dir, resource_path, state_path
 from gradefiller.playwright_worker import PlaywrightWorker
 
 log = logging.getLogger("gradefiller")
@@ -108,6 +108,9 @@ class GradeFillerApp:
     def __init__(self, page: ft.Page):
         self.page = page
         self.page.title = "Grade Filler"
+        icon = resource_path("assets/icon.ico")
+        if icon.exists():
+            self.page.window.icon = str(icon)  # title bar + taskbar (Windows only)
         self.page.window.width = 900
         self.page.window.height = 720
         self.page.window.min_width = 720
