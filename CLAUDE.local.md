@@ -60,7 +60,7 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 
 ## Recent fixes (newest first)
 
-- **App icon** (branch `windows-exe`): the user's A+ image, cropped and turned into `assets/icon.ico`; set on the `.exe` and the app window; the self-test fails if it isn't bundled.
+- **App icon** (branch `windows-exe`): the user's A+ image, cropped and turned into `assets/icon.ico`; set on the `.exe` and the app window; the self-test fails if it isn't bundled. **Tested on the Windows computer (2026-11-20): everything works**; the icon showed in the taskbar but not on the desktop. Checked: the icon *is* embedded in the `.exe` (all 7 sizes extracted from the build). Cause: Windows' icon cache remembered the first, icon-less `GradeFiller.exe`. Fix: rename the file, or Win+R → `ie4uinit.exe -show`, or restart. A fresh laptop isn't affected.
 
 - **GitHub build for the `.exe`** (branch `windows-exe`). `build-windows.yml` on `windows-latest`, Python 3.12: installs `requirements.txt` + `pyinstaller`, `flet pack main.py --name GradeFiller` (single file, no console), then runs `GradeFiller.exe --self-test` and fails unless Edge started from inside the bundle. Manual "Run workflow" (once on `main`) or any PR into `main` → download from the run's Artifacts; pushing tag `vX.Y.Z` also creates a Release, so the newest is always at `releases/latest/download/GradeFiller.exe`.
 
