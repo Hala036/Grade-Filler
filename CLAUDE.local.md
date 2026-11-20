@@ -12,7 +12,7 @@
 > comes with every download. (The user lost an earlier set of notes once.) Commit
 > your updates to it along with your code changes.
 
-**Last updated:** 2026-11-20 · **`main`:** current, working version (`improving-UI` merged after a successful real run) · **Work happens on one branch per feature**, merged into `main` by pull request
+**Last updated:** 2026-11-20 · **Released: v1.0.0** (first Windows `.exe`, tag on `main`) · **`main`:** current, working version · **Work happens on one branch per feature**, merged into `main` by pull request
 
 ## What this is
 
@@ -49,6 +49,10 @@ python -m venv .venv
 ```
 On Windows, skip `activate` (script execution policy errors). Call `.venv\Scripts\python` directly.
 New computer without git: download https://github.com/Hala036/Grade-Filler/archive/refs/heads/main.zip
+
+**The teacher's download link** (always the newest release): https://github.com/Hala036/Grade-Filler/releases/latest/download/GradeFiller.exe
+
+**Releasing a new version:** merge the PR into `main`, then `git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z`. The workflow builds, self-tests and publishes the Release. Numbers: 1.0.1 = small fix, 1.1.0 = new feature, 2.0.0 = big change. Test builds (PRs, manual runs) are labelled 0.0.0 on purpose.
 
 ## Decisions the user made (don't undo without asking)
 
@@ -98,8 +102,8 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 
 ## Next features
 
-1. **Windows `.exe`, no terminal (top priority).** Plan: GitHub Actions on `windows-latest` builds a single file (`flet pack`, which wraps PyInstaller) from `main.py`, uploaded as a build artifact/release. Saved login already lives in `%APPDATA%`. Expect a SmartScreen "More info → Run anyway" on first launch (unsigned). Needs the user's go-ahead before pushing a workflow. The `.exe` is never built by hand or committed: pushing a tag like `v1.0.0` builds it on GitHub and attaches it to a Release (user agreed, 2026-11-20).
-   - Done: the installed Edge/Chrome is used (see Recent fixes), so nothing browser-related is bundled. Small risk: a future auto-updated Edge could outrun the pinned Playwright, in which case bump `playwright` in `requirements.txt` and rebuild.
+1. **Update notice / self-update (next, own branch).** Until then every new version must be downloaded by hand. Plan: at startup check `releases/latest` on GitHub; if newer than the running version, show "A new version (X) is available. [Update]"; download the new `.exe`, swap it in (rename the running one to `.old`, since Windows can't overwrite a running `.exe`), restart. Needs the version baked into the build (e.g. a generated `gradefiller/_version.py` in the workflow).
+   - Done before this: v1.0.0, the Windows `.exe` (PRs #1, #2). Tested on the Windows computer 2026-11-20.
 2. Whatever the user asks for next. Add it here.
    - Possible: remember the round-up setting between runs (today it resets each launch).
    - The local sample sheet `2251-1214311-sec1-Grades.xlsx` (gitignored) was removed from the folder on 2026-11-20; tests since then use made-up data.
