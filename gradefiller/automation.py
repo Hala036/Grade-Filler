@@ -332,8 +332,10 @@ class PortalSession:
     def _watch_login_page(self) -> None:
         def typed(_source, username, password):
             if username and password:
-                self.typed_login = (str(username).strip(), str(password))
-                log.info("Login page: a username and password were entered")
+                login = (str(username).strip(), str(password))
+                if login != self.typed_login:
+                    log.info("Login page: a username and password were entered")
+                self.typed_login = login
 
         self.context.expose_binding("gfLoginTyped", typed)
         self.context.add_init_script(_LOGIN_PAGE_JS % json.dumps(self.sso_host))
@@ -349,6 +351,14 @@ class PortalSession:
         self.saved_login = login
         if self._alive():
             self._send_saved_login()
+
+    def take_typed_login(self) -> Optional[tuple[str, str]]:
+        """What the teacher typed on the login page, once they're past it (then
+        cleared). None while still on the login page: it may have been wrong."""
+        if self.typed_login is None or self.on_login_page():
+            return None
+        typed, self.typed_login = self.typed_login, None
+        return typed
 
     def on_login_page(self) -> bool:
         try:

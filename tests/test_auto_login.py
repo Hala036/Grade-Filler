@@ -100,6 +100,11 @@ class AutoLoginTests(unittest.TestCase):
         self.assertTrue(s.on_login_page())
         # The teacher types and presses Log in while Python is idle (as it is
         # while the app waits for them); Python only looks again afterwards.
+        s.page.evaluate("() => { document.querySelector('#username').value = 'teacher1'; "
+                        "document.querySelector('#password').value = 'typo'; "
+                        "window.gfLoginTyped('teacher1', 'typo'); }")
+        s.page.wait_for_timeout(200)
+        self.assertIsNone(s.take_typed_login())  # still on the login page: may be wrong
         s.page.evaluate("""() => setTimeout(() => {
             document.querySelector('#username').value = 'teacher1';
             document.querySelector('#password').value = 's3cret';
@@ -108,7 +113,8 @@ class AutoLoginTests(unittest.TestCase):
         time.sleep(2)
         self.assertTrue(s.wait_for_manual_login(self.course, timeout_s=10))
         self.assertIn("COURSES", s.page.content())  # taken on to the course list
-        self.assertEqual(s.typed_login, GOOD)
+        self.assertEqual(s.take_typed_login(), GOOD)
+        self.assertIsNone(s.take_typed_login())  # handed over once only
         self.assertTrue((self.tmp / "state.json").exists())  # the new login was kept
 
     def test_wait_for_manual_login_ends_when_browser_closes(self):

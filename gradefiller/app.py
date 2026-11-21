@@ -32,7 +32,7 @@ from typing import Optional
 import flet as ft
 import pandas as pd
 
-from gradefiller import automation, credentials, matching, updater
+from gradefiller import automation, credentials, matching, settings, updater
 from gradefiller.round_line import RoundLine, tenth_label
 from gradefiller.paths import app_data_dir, resource_path, state_path
 from gradefiller.playwright_worker import PlaywrightWorker
@@ -127,7 +127,6 @@ class GradeFillerApp:
         # Saved portal login (see credentials.py); filled in on the login page.
         self.can_save_login = credentials.available()
         self.saved_login: Optional[credentials.Login] = credentials.load() if self.can_save_login else None
-        self._declined_save = False  # "Not now" to saving the password: don't ask again this run
         self.file_picker = ft.FilePicker()  # keep a reference: services are dropped otherwise
 
         # Step 2
@@ -443,7 +442,9 @@ class GradeFillerApp:
                     "Your saved password didn't work. Log in in the browser window with your current password."
                     if self.saved_login else "Log in in the browser window.",
                 )
-                return "logged-in" if session.wait_for_manual_login() else "not-logged-in"
+                logged_in = session.wait_for_manual_login()
+                self._hand_over_typed_login(session)
+                return "logged-in" if logged_in else "not-logged-in"
 
             def ok(result):
                 open_btn.disabled = False
@@ -453,10 +454,6 @@ class GradeFillerApp:
                     return
                 show("Now go to the course and section in the browser and open its grade table, "
                      "then come back here.")
-                if result == "logged-in":
-                    session = self._session()
-                    typed, session.typed_login = session.typed_login, None
-                    self._offer_to_save_login(typed)
 
             def err(e):
                 open_btn.disabled = False
@@ -508,11 +505,10 @@ class GradeFillerApp:
             except Exception:
                 pass
             log.info("save_session: %.0f ms", _ms(t))
-            typed, session.typed_login = session.typed_login, None
-            return grids, typed
+            self._hand_over_typed_login(session)  # logged in by hand meanwhile
+            return grids
 
-        def ok(result):
-            grids, typed = result
+        def ok(grids):
             grids = [g for g in grids if g.cols > 0]
             if not grids:
                 log.info("No tables found (%.0f ms total)", _ms(clicked))
@@ -544,7 +540,6 @@ class GradeFillerApp:
             t = time.perf_counter()
             on_done()
             log.info("Next screen built in %.0f ms; %.0f ms in total since the click", _ms(t), _ms(clicked))
-            self._offer_to_save_login(typed)
 
         def err(e):
             log.info("Table search failed after %.0f ms: %s", _ms(clicked), e)
@@ -1296,6 +1291,9 @@ class GradeFillerApp:
         if self.saved_login:
             items.append(ft.PopupMenuItem(content=ft.Text("Forget my password"), icon=ft.Icons.KEY_OFF,
                                           on_click=self._forget_password_clicked))
+        elif self.can_save_login and settings.get(settings.NEVER_ASK_TO_SAVE_PASSWORD):
+            items.append(ft.PopupMenuItem(content=ft.Text("Offer to save my password again"), icon=ft.Icons.KEY,
+                                          on_click=self._ask_again_clicked))
         self.account_holder.content = ft.PopupMenuButton(
             content=ft.Row(
                 [ft.Icon(ft.Icons.ACCOUNT_CIRCLE, color=ft.Colors.BLUE_GREY_600, size=20),
@@ -1317,13 +1315,23 @@ class GradeFillerApp:
             session = self.session
             self.pw.submit(lambda: session.set_saved_login(login))
 
+    def _hand_over_typed_login(self, session: automation.PortalSession):
+        """On the browser thread: if the teacher just logged in by hand, ask
+        (on the UI thread) whether to save it. Called wherever a login can
+        finish, so it's never missed."""
+        typed = session.take_typed_login()
+        if typed:
+            self._on_ui_thread(self._offer_to_save_login, typed)
+
     def _offer_to_save_login(self, typed: Optional[tuple[str, str]]):
-        if not typed or not self.can_save_login or self._declined_save:
+        if not typed or not self.can_save_login:
             return
         login = credentials.Login(*typed)
         if login == self.saved_login:
             return
         update = self.saved_login is not None and self.saved_login.username == login.username
+        if not update and settings.get(settings.NEVER_ASK_TO_SAVE_PASSWORD):
+            return
 
         def save(_):
             self.page.pop_dialog()
@@ -1335,7 +1343,12 @@ class GradeFillerApp:
 
         def not_now(_):
             self.page.pop_dialog()
-            self._declined_save = True
+
+        def never(_):
+            self.page.pop_dialog()
+            settings.set(settings.NEVER_ASK_TO_SAVE_PASSWORD, True)
+            self._refresh_account()
+            self.page.update()
 
         self.page.show_dialog(
             ft.AlertDialog(
@@ -1348,11 +1361,17 @@ class GradeFillerApp:
                     "so only save it on your own computer."
                 ),
                 actions=[
+                    *([] if update else [ft.TextButton("Don't ask again", on_click=never)]),
                     ft.TextButton("Not now", on_click=not_now),
                     ft.FilledButton("Update password" if update else "Save password", on_click=save),
                 ],
             )
         )
+
+    def _ask_again_clicked(self, _=None):
+        settings.set(settings.NEVER_ASK_TO_SAVE_PASSWORD, False)
+        self._refresh_account()
+        self._show_message("Okay", "Next time you log in to the portal, Grade Filler will offer to save your password.")
 
     def _forget_password_clicked(self, _=None):
         credentials.forget()
@@ -1368,7 +1387,6 @@ class GradeFillerApp:
         def go(_):
             self.page.pop_dialog()
             credentials.forget()
-            self._declined_save = False
             if self.session is not None:
                 self.session.stop_waiting = True  # if it's waiting on the login page
             self._use_saved_login(None)
