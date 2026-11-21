@@ -629,7 +629,7 @@ class GradeFillerApp:
         if not self.round_up_on:
             return None, None
         if not self.round_rule.active:
-            return None, "Rounding is on, but no arrow is showing. Drag the dots apart, or untick it."
+            return None, "Drag the dots apart, or untick Round grades."
         return self.round_rule, None
 
     @staticmethod
@@ -820,10 +820,7 @@ class GradeFillerApp:
 
                 def show_round_text():
                     _, problem = self._round_up_rule()
-                    round_text.value = problem or (
-                        self._round_summary(self.round_rule)
-                        + ". This is the part after the point; whole numbers stay as they are."
-                    )
+                    round_text.value = problem or self._round_summary(self.round_rule)
                     round_text.color = ERROR if problem else INFO
 
                 def on_line_change(rule):
@@ -836,13 +833,6 @@ class GradeFillerApp:
                     ft.Container(
                         content=ft.Column(
                             [
-                                ft.Text(
-                                    "Grades under an arrow are rounded up to where it points; "
-                                    "decimals before the first arrow are dropped. "
-                                    "Drag the dots, or click on the line.",
-                                    size=13,
-                                    color=INFO,
-                                ),
                                 RoundLine(self.round_rule, on_line_change).control,
                                 round_text,
                             ],
@@ -1029,7 +1019,7 @@ class GradeFillerApp:
             summary.append(self._fact(
                 ft.Icons.TRENDING_UP,
                 f"{n} grade{'s' if n != 1 else ''} will be rounded ({self._round_summary(job.round_up)})."
-                if n else "Round-up is on, but no grades needed rounding.",
+                if n else "No grades need rounding.",
                 INFO,
             ))
             if n:
