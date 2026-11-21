@@ -19,7 +19,12 @@ def run(report: Path = Path("selftest.txt")) -> int:
 
         from gradefiller.automation import PortalSession
 
+        from gradefiller import updater
+        from gradefiller._version import __version__
+
         lines.append("imports: ok")
+        lines.append(f"version: {__version__}")
+        lines.append(f"packed exe: {updater.is_packed_exe()} ({updater.running_exe()})")
         from gradefiller.paths import resource_path
 
         icon = resource_path("assets/icon.ico")
