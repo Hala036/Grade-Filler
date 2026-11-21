@@ -2,8 +2,10 @@
 
 The amber arrow starts at `start` and points at `joint`; the green one
 starts at `joint` and points at `end`. Everything under an arrow is rounded
-up to where it points. All three points can be dragged (or clicked to);
-they snap to tenths and push each other so they never cross.
+up to where it points; decimals before the amber arrow drop to .0. All
+three points can be dragged (or clicked to); they snap to steps of 0.05 and
+push each other so they never cross. Numbers are printed at the tenths only;
+a point between them gets its own small label above it.
 """
 from __future__ import annotations
 
@@ -12,7 +14,7 @@ from typing import Callable, Optional
 import flet as ft
 import flet.canvas as cv
 
-from gradefiller.automation import RoundUp
+from gradefiller.automation import ROUND_STEPS, RoundUp, step_label
 
 AMBER, AMBER_DARK = ft.Colors.AMBER_400, ft.Colors.AMBER_800
 GREEN, GREEN_DARK = ft.Colors.GREEN_400, ft.Colors.GREEN_700
@@ -24,10 +26,6 @@ LINE_Y = 30
 HANDLE_R = 9
 HEAD_LEN, HEAD_HALF = 15, 10
 SHAFT = 8
-
-
-def tenth_label(n: int) -> str:
-    return "0" if n == 0 else "1" if n == 10 else f"0.{n}"
 
 
 def _paint(color, width: float = 0, fill: bool = False) -> ft.Paint:
@@ -64,12 +62,12 @@ class RoundLine:
 
     @staticmethod
     def x(n: float) -> float:
-        return PAD_X + n * (WIDTH - 2 * PAD_X) / 10
+        return PAD_X + n * (WIDTH - 2 * PAD_X) / ROUND_STEPS
 
     @staticmethod
-    def tenth_at(x: float) -> int:
-        n = round((x - PAD_X) / ((WIDTH - 2 * PAD_X) / 10))
-        return max(0, min(10, n))
+    def step_at(x: float) -> int:
+        n = round((x - PAD_X) / ((WIDTH - 2 * PAD_X) / ROUND_STEPS))
+        return max(0, min(ROUND_STEPS, n))
 
     # ---------- moving points ----------
 
@@ -107,7 +105,7 @@ class RoundLine:
             self._dragging, self._pending = None, cands
 
     def _pan_update(self, e: ft.DragUpdateEvent):
-        n = self.tenth_at(e.local_position.x)
+        n = self.step_at(e.local_position.x)
         if self._dragging is None:
             if not self._pending:
                 return
@@ -122,7 +120,7 @@ class RoundLine:
         self._dragging, self._pending = None, []
 
     def _tap(self, e: ft.TapEvent):
-        n = self.tenth_at(e.local_position.x)
+        n = self.step_at(e.local_position.x)
         cands = self._nearest(e.local_position.x)
         here = self.points[cands[0]]
         if n != here:
@@ -160,15 +158,18 @@ class RoundLine:
     def _shapes(self) -> list[cv.Shape]:
         start, joint, end = self.points
         amber_on, green_on = start < joint, joint < end
-        shapes: list[cv.Shape] = [cv.Line(self.x(0), LINE_Y, self.x(10), LINE_Y, paint=_paint(AXIS, 2))]
-        for n in range(11):
+        shapes: list[cv.Shape] = [cv.Line(self.x(0), LINE_Y, self.x(ROUND_STEPS), LINE_Y, paint=_paint(AXIS, 2))]
+        for n in range(ROUND_STEPS + 1):
+            if n % 2:  # 0.05, 0.15 …: a short tick, no number
+                shapes.append(cv.Line(self.x(n), LINE_Y - 3, self.x(n), LINE_Y + 3, paint=_paint(AXIS, 1.5)))
+                continue
             key = n in self.points and (amber_on or green_on)
             shapes.append(cv.Line(self.x(n), LINE_Y - 6, self.x(n), LINE_Y + 6, paint=_paint(AXIS, 2)))
             shapes.append(
                 cv.Text(
                     self.x(n),
                     LINE_Y + 16,
-                    tenth_label(n),
+                    step_label(n),
                     style=ft.TextStyle(
                         size=12,
                         color=ft.Colors.BLUE_GREY_900 if key else LABEL,
@@ -187,4 +188,18 @@ class RoundLine:
         if green_on:
             shapes += self._handle(end, GREEN_DARK)
         shapes += self._handle(joint, GREEN_DARK if green_on else AMBER_DARK)
+
+        # A point between two printed numbers (0.25 …) gets its value above it.
+        shown = {start, joint} | ({end} if green_on else set())
+        for n in sorted(shown):
+            if n % 2:
+                shapes.append(
+                    cv.Text(
+                        self.x(n),
+                        LINE_Y - HANDLE_R - 4,
+                        step_label(n),
+                        style=ft.TextStyle(size=11, color=ft.Colors.BLUE_GREY_900, weight=ft.FontWeight.BOLD),
+                        alignment=ft.Alignment.BOTTOM_CENTER,
+                    )
+                )
         return shapes

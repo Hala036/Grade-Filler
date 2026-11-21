@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+from decimal import Decimal
 import sys
 import threading
 import urllib.error
@@ -33,7 +34,8 @@ import flet as ft
 import pandas as pd
 
 from gradefiller import automation, credentials, matching, settings, updater
-from gradefiller.round_line import RoundLine, tenth_label
+from gradefiller.automation import step_label, step_value
+from gradefiller.round_line import RoundLine
 from gradefiller.paths import app_data_dir, resource_path, state_path
 from gradefiller.playwright_worker import PlaywrightWorker
 
@@ -145,9 +147,9 @@ class GradeFillerApp:
         self.id_portal: Optional[int] = None
         self.id_excel: Optional[str] = None
         self.grade_pairs: list[dict] = []  # {"excel": str|None, "portal": int|None}
-        self.blank_as_zero = False
+        self.zero_as_blank = True  # a 0 in Excel leaves the portal cell as it is
         self.round_up_on = False
-        self.round_rule = automation.RoundUp()  # the usual rule: .1-.4 -> .5, .5+ -> 1
+        self.round_rule = automation.RoundUp()  # the usual rule: .1-.49 -> .5, .5+ -> 1, below .1 -> .0
         self._mapping_source = None  # what the current mapping was suggested for
 
         # Step 5
@@ -632,19 +634,19 @@ class GradeFillerApp:
 
     @staticmethod
     def _round_summary(rule: automation.RoundUp) -> str:
-        """The rule in words, e.g. "below 0.2 stays · 0.2–0.49 → 0.5 · 0.5–0.99 → 1"."""
-        def upto(n: int) -> str:  # the highest value under an arrow ending at n
-            return f"0.{n - 1}9"
+        """The rule in words, e.g. "below 0.1 → 0 · 0.1–0.49 → 0.5 · 0.5–0.99 → 1"."""
+        def upto(n: int) -> str:  # the highest value (2 decimals) under an arrow ending at n
+            return format(step_value(n) - Decimal("0.01"), "f")
 
         parts = []
         if rule.start > 0:
-            parts.append(f"below {tenth_label(rule.start)} stays")
+            parts.append(f"below {step_label(rule.start)} → 0")
         if rule.start < rule.joint:
-            parts.append(f"{tenth_label(rule.start)}–{upto(rule.joint)} → {tenth_label(rule.joint)}")
+            parts.append(f"{step_label(rule.start)}–{upto(rule.joint)} → {step_label(rule.joint)}")
         if rule.joint < rule.end:
-            parts.append(f"{tenth_label(rule.joint)}–{upto(rule.end)} → {tenth_label(rule.end)}")
-        if rule.end < 10:
-            parts.append(f"{tenth_label(rule.end)} and above stays")
+            parts.append(f"{step_label(rule.joint)}–{upto(rule.end)} → {step_label(rule.end)}")
+        if rule.end < automation.ROUND_STEPS:
+            parts.append(f"{step_label(rule.end)} and above stays")
         return " · ".join(parts)
 
     def _build_step_mapping(self) -> ft.Control:
@@ -794,18 +796,18 @@ class GradeFillerApp:
                 self.grade_pairs.append({"portal": None, "excel": None})
                 render()
 
-            blank_cb = ft.Checkbox(
-                label="Write 0 for blank Excel cells (otherwise they're left as they are)",
-                value=self.blank_as_zero,
+            zero_cb = ft.Checkbox(
+                label="If a grade is 0, leave the portal cell as it is (like an empty Excel cell)",
+                value=self.zero_as_blank,
             )
 
-            def on_blank(e):
-                self.blank_as_zero = bool(e.control.value)
+            def on_zero(e):
+                self.zero_as_blank = bool(e.control.value)
 
-            blank_cb.on_change = on_blank
+            zero_cb.on_change = on_zero
 
             # --- Optional round-up: two joined arrows on a 0-1 line ---
-            round_cb = ft.Checkbox(label="Round grades up", value=self.round_up_on)
+            round_cb = ft.Checkbox(label="Round grades", value=self.round_up_on)
 
             def on_round(e):
                 self.round_up_on = bool(e.control.value)
@@ -835,7 +837,8 @@ class GradeFillerApp:
                         content=ft.Column(
                             [
                                 ft.Text(
-                                    "Grades under an arrow are rounded up to where it points. "
+                                    "Grades under an arrow are rounded up to where it points; "
+                                    "decimals before the first arrow are dropped. "
                                     "Drag the dots, or click on the line.",
                                     size=13,
                                     color=INFO,
@@ -861,7 +864,7 @@ class GradeFillerApp:
                     ),
                     *rows,
                     ft.TextButton("Add another column", icon=ft.Icons.ADD, on_click=add_row),
-                    blank_cb,
+                    zero_cb,
                     *round_controls,
                 ],
             )
@@ -987,7 +990,7 @@ class GradeFillerApp:
             sheet_name=self.sheet_name,
             id_mapping=automation.ColumnMapping(idg.index, idg.label, self.id_excel),
             grade_mappings=mappings,
-            blank_as_zero=self.blank_as_zero,
+            zero_as_blank=self.zero_as_blank,
             round_up=self._round_up_rule()[0],
         )
         self.plan = automation.build_fill_plan(self.job, self.df, portal_ids=idg.values)
@@ -1025,15 +1028,17 @@ class GradeFillerApp:
             n = len(plan.rounded)
             summary.append(self._fact(
                 ft.Icons.TRENDING_UP,
-                f"{n} grade{'s' if n != 1 else ''} will be rounded up ({self._round_summary(job.round_up)})."
+                f"{n} grade{'s' if n != 1 else ''} will be rounded ({self._round_summary(job.round_up)})."
                 if n else "Round-up is on, but no grades needed rounding.",
                 INFO,
             ))
             if n:
-                details.append("Rounded up:\n" + "\n".join(f"  • {r}" for r in plan.rounded[:30])
+                details.append("Rounded:\n" + "\n".join(f"  • {r}" for r in plan.rounded[:30])
                                + (f"\n  … and {n - 30} more" if n > 30 else ""))
         if plan.blank_cells:
             details.append(f"{plan.blank_cells} blank Excel cells will be left as they are.")
+        if plan.zero_cells:
+            details.append(f"{plan.zero_cells} grades of 0 will be left as they are in the portal.")
         if plan.rows_without_id:
             details.append(f"{plan.rows_without_id} Excel rows have no student ID (ignored).")
 
