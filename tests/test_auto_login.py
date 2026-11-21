@@ -106,8 +106,16 @@ class AutoLoginTests(unittest.TestCase):
             document.querySelector('#submit_button').click();
         }, 300)""")
         time.sleep(2)
-        self.assertIn("WELCOME", s.page.content())
+        self.assertTrue(s.wait_for_manual_login(self.course, timeout_s=10))
+        self.assertIn("COURSES", s.page.content())  # taken on to the course list
         self.assertEqual(s.typed_login, GOOD)
+        self.assertTrue((self.tmp / "state.json").exists())  # the new login was kept
+
+    def test_wait_for_manual_login_ends_when_browser_closes(self):
+        s = self.session()
+        s.open_course_list(self.course)
+        s.page.close()
+        self.assertFalse(s.wait_for_manual_login(self.course, timeout_s=10))
 
     def test_saved_login_signs_in(self):
         s = self.session(Login(*GOOD))

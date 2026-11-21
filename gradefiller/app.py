@@ -128,7 +128,6 @@ class GradeFillerApp:
         self.can_save_login = credentials.available()
         self.saved_login: Optional[credentials.Login] = credentials.load() if self.can_save_login else None
         self._declined_save = False  # "Not now" to saving the password: don't ask again this run
-        self._open_portal_on_arrival = False  # open the browser as soon as the Course Table step shows
         self.file_picker = ft.FilePicker()  # keep a reference: services are dropped otherwise
 
         # Step 2
@@ -303,7 +302,7 @@ class GradeFillerApp:
             "Continue",
             icon=ft.Icons.ARROW_FORWARD,
             disabled=self.df is None or self.df.empty,
-            on_click=self._excel_continue,
+            on_click=lambda _: self._go_to(STEP_GRID),
         )
 
         def show_preview():
@@ -419,76 +418,78 @@ class GradeFillerApp:
             ],
         )
 
-    def _excel_continue(self, _=None):
-        self._open_portal_on_arrival = True
-        self._go_to(STEP_GRID)
-
     # ---------- Step 2: Open the course grade table ----------
 
     def _build_step_grid(self) -> ft.Control:
         status = ft.Text("")
-        open_btn = ft.OutlinedButton("Open the portal again", icon=ft.Icons.OPEN_IN_BROWSER)
+        open_btn = ft.FilledButton("Open the portal", icon=ft.Icons.OPEN_IN_BROWSER)
         ready_btn = ft.FilledButton("The grade table is showing — continue", icon=ft.Icons.ARROW_FORWARD)
+
+        def show(msg, color=INFO):
+            self._set_status(status, msg, color)
+            self.page.update()
 
         def open_click(_):
             open_btn.disabled = True
-            self._set_status(
-                status, "Opening the portal and logging you in…" if self.saved_login else "Opening the portal…"
-            )
-            self.page.update()
+            show("Opening the portal and logging you in…" if self.saved_login else "Opening the portal…")
 
-            def task():
+            def task():  # on the browser thread
                 session = self._session()
                 session.open_course_list()
-                return session.on_login_page()
+                if not session.on_login_page():
+                    return "open"
+                self._on_ui_thread(
+                    show,
+                    "Your saved password didn't work. Log in in the browser window with your current password."
+                    if self.saved_login else "Log in in the browser window.",
+                )
+                return "logged-in" if session.wait_for_manual_login() else "not-logged-in"
 
-            def ok(on_login_page):
+            def ok(result):
                 open_btn.disabled = False
-                if not on_login_page:
-                    msg = "The portal is open. Go to the course and section, open its grade table, then come back here."
-                elif self.saved_login:
-                    msg = ("Your saved password didn't work. Log in in the browser window "
-                           "(Grade Filler will offer to save the new password), then open the grade table.")
-                else:
-                    msg = "Log in in the browser window, then go to the course and section and open its grade table."
-                self._set_status(status, msg)
-                self.page.update()
+                open_btn.content = "Open the portal again"
+                if result == "not-logged-in":
+                    show("Not logged in yet. Click “Open the portal again” to try once more.", WARN)
+                    return
+                show("Now go to the course and section in the browser and open its grade table, "
+                     "then come back here.")
+                if result == "logged-in":
+                    session = self._session()
+                    typed, session.typed_login = session.typed_login, None
+                    self._offer_to_save_login(typed)
 
             def err(e):
                 open_btn.disabled = False
-                self._set_status(status, f"Couldn't open the portal: {self._error_text(e)}", ERROR)
-                self.page.update()
+                show(f"Couldn't open the portal: {self._error_text(e)}", ERROR)
 
             self.pw.submit(task, ok, err)
 
         def ready_click(_):
             ready_btn.disabled = True
             open_btn.disabled = True
-            self._set_status(status, "Looking for the grade table…")
-            self.page.update()
+            show("Looking for the grade table…")
             self._scan(
                 on_done=lambda: self._go_to(STEP_MAP),
                 on_fail=lambda msg: (
                     setattr(ready_btn, "disabled", False),
                     setattr(open_btn, "disabled", False),
-                    self._set_status(status, msg, ERROR),
-                    self.page.update(),
+                    show(msg, ERROR),
                 ),
             )
 
         open_btn.on_click = open_click
         ready_btn.on_click = ready_click
-        if self._open_portal_on_arrival:
-            self._open_portal_on_arrival = False
-            self._on_ui_thread(open_click, None)  # after this screen is shown
 
+        login_note = (
+            f"Grade Filler logs you in with the saved password for {self.saved_login.username}."
+            if self.saved_login else "If the portal asks you to log in, log in there."
+        )
         return self._step_layout(
             "Step 2: Open the grade table",
-            "Grade Filler opens the portal in a browser window. If it asks you to log in, log in there. "
-            "Then go to the exact course and section and open its grade table (if it opens in a popup, "
-            "leave the popup open). Every course's table is different, so this part is up to you. "
-            "Then come back here.",
-            [ft.Row([ready_btn, open_btn], wrap=True), status],
+            "Click “Open the portal”. In the browser, go to the exact course and section and open its "
+            "grade table (if it opens in a popup, leave the popup open). Then come back here and click "
+            f"“The grade table is showing”. {login_note}",
+            [ft.Row([open_btn, ready_btn], wrap=True), status],
             back_to=STEP_EXCEL,
         )
 
@@ -1368,6 +1369,8 @@ class GradeFillerApp:
             self.page.pop_dialog()
             credentials.forget()
             self._declined_save = False
+            if self.session is not None:
+                self.session.stop_waiting = True  # if it's waiting on the login page
             self._use_saved_login(None)
 
             def task():
@@ -1375,12 +1378,8 @@ class GradeFillerApp:
 
             def done(_r=None):
                 self._refresh_account()
-                if self.step_index > STEP_GRID:
-                    self._open_portal_on_arrival = True
+                if self.step_index >= STEP_GRID:
                     self._go_to(STEP_GRID)  # the table belonged to the other account
-                elif self.step_index == STEP_GRID:
-                    self._open_portal_on_arrival = True
-                    self._render_step()
                 else:
                     self.page.update()
 
@@ -1393,7 +1392,7 @@ class GradeFillerApp:
                 title=ft.Text("Switch account?"),
                 content=ft.Text(
                     f"This logs you out of the portal{forget}. "
-                    "Then log in with the other account when the portal opens.\n\n"
+                    "Then log in with the other account when you open the portal.\n\n"
                     "Did you fill grades in the portal without clicking the portal's Save button yet? "
                     "Then click Cancel and save first, or the grades will be lost."
                 ),
@@ -1555,6 +1554,8 @@ class GradeFillerApp:
 
     def _shut_down(self):
         self._stop_requested = True
+        if self.session is not None:
+            self.session.stop_waiting = True
         closed = threading.Event()
 
         def destroy(*_):

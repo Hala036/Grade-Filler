@@ -273,6 +273,7 @@ class PortalSession:
         # What the teacher last typed on the login page (username, password),
         # kept in memory only, until the app asks whether to save it.
         self.typed_login: Optional[tuple[str, str]] = None
+        self.stop_waiting = False  # set from the UI to end wait_for_manual_login early
         self._playwright = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
@@ -332,6 +333,7 @@ class PortalSession:
         def typed(_source, username, password):
             if username and password:
                 self.typed_login = (str(username).strip(), str(password))
+                log.info("Login page: a username and password were entered")
 
         self.context.expose_binding("gfLoginTyped", typed)
         self.context.add_init_script(_LOGIN_PAGE_JS % json.dumps(self.sso_host))
@@ -374,8 +376,32 @@ class PortalSession:
             if not self._wait_for_auto_login():
                 log.info("Saved login didn't get past the login page")
                 return  # wrong/old password: the teacher logs in by hand
+            log.info("Logged in with the saved password")
+            self.save_session()  # keep the fresh login
             if self.page.url.split("?")[0] != url:
                 self.page.goto(url, wait_until="domcontentloaded")
+
+    def wait_for_manual_login(self, url: str = COURSE_PAGE_URL, timeout_s: float = 600) -> bool:
+        """While the teacher logs in by hand: wait until they're past the login
+        page, keep the new login and go to url. False if they closed the
+        browser, took too long, or stop_waiting was set."""
+        self.stop_waiting = False
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline and not self.stop_waiting:
+            try:
+                if not self._alive() or self.page is None or self.page.is_closed():
+                    return False
+                if self.sso_host not in self.page.url:
+                    self.page.wait_for_load_state("domcontentloaded")
+                    log.info("Logged in by hand")
+                    self.save_session()
+                    if self.page.url.split("?")[0] != url:
+                        self.page.goto(url, wait_until="domcontentloaded")
+                    return True
+                self.page.wait_for_timeout(500)
+            except PwError:
+                return False
+        return False
 
     def _wait_for_auto_login(self, timeout_s: float = 20) -> bool:
         """True once the browser has left the login page; False if the login
