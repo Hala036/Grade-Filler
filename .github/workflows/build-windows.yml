@@ -49,6 +49,7 @@ jobs:
           --name GradeFiller
           --icon assets/icon.ico
           --add-data "assets/icon.ico:assets"
+          --hidden-import keyring.backends.Windows
           --product-name "Grade Filler"
           --file-description "Grade Filler"
           --product-version "${{ steps.version.outputs.number }}"
@@ -65,6 +66,7 @@ jobs:
           if ($p.ExitCode -ne 0) { throw "Self-test failed (exit code $($p.ExitCode))" }
           if (-not (Select-String -Path selftest.txt -Pattern "msedge: ok" -Quiet)) { throw "Edge didn't start" }
           if (-not (Select-String -Path selftest.txt -Pattern "version: ${{ steps.version.outputs.number }}" -SimpleMatch -Quiet)) { throw "Wrong version inside the .exe" }
+          if (-not (Select-String -Path selftest.txt -Pattern "password store: ok" -SimpleMatch -Quiet)) { throw "Windows Credential Manager doesn't work from the .exe" }
 
       - uses: actions/upload-artifact@v4
         with:
