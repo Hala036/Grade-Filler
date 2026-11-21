@@ -1335,8 +1335,10 @@ class GradeFillerApp:
         if not (updater.is_packed_exe() or os.environ.get("GRADEFILLER_CHECK_UPDATES")):
             return
 
+        # Its own thread: it may wait for the old version to finish closing.
+        threading.Thread(target=updater.clean_up_old, name="update-cleanup", daemon=True).start()
+
         def work():
-            updater.clean_up_old()
             try:
                 release = updater.check_for_update()
             except Exception as e:  # noqa: BLE001  offline etc.: say nothing

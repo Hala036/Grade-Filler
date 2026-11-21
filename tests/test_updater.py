@@ -135,6 +135,26 @@ class DownloadAndSwapTests(unittest.TestCase):
         self.assertFalse((self.dir / "GradeFiller.exe.old").exists())
         self.assertTrue(exe.exists())
 
+    def test_clean_up_old_waits_for_old_program(self):
+        exe = self.dir / "GradeFiller.exe"
+        old = self.dir / "GradeFiller.exe.old"
+        exe.write_bytes(b"x")
+        old.write_bytes(b"x")
+        real_unlink = Path.unlink
+        locked = {"n": 2}  # the first two tries fail, as while it's still closing
+
+        def unlink(p, *a, **k):
+            if p == old and locked["n"]:
+                locked["n"] -= 1
+                raise PermissionError("in use")
+            return real_unlink(p, *a, **k)
+
+        with mock.patch("gradefiller.updater.is_packed_exe", return_value=True), \
+                mock.patch("gradefiller.updater.running_exe", return_value=exe), \
+                mock.patch.object(Path, "unlink", unlink):
+            updater.clean_up_old(tries=5, wait=0)
+        self.assertFalse(old.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

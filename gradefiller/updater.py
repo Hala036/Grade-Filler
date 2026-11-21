@@ -25,6 +25,7 @@ import os
 import ssl
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -37,7 +38,6 @@ log = logging.getLogger("gradefiller")
 
 REPO = "Hala036/Grade-Filler"
 LATEST_API = f"https://api.github.com/repos/{REPO}/releases/latest"
-DOWNLOAD_PAGE = f"https://github.com/{REPO}/releases/latest"
 ASSET_NAME = "GradeFiller.exe"
 USER_AGENT = "GradeFiller-updater"
 
@@ -226,17 +226,31 @@ def install_update(release: Release, on_progress: Optional[Callable[[int, int], 
     restart(exe)
 
 
-def clean_up_old() -> None:
-    """Delete the *.old (and stray *.new / *.part) left by the last update."""
+def clean_up_old(tries: int = 15, wait: float = 2.0) -> None:
+    """Delete the *.old (and stray *.new / *.part) left by the last update.
+
+    Right after an update the old program is still closing its browser, and
+    Windows won't delete a file that is still running, so keep trying for up
+    to ~30 s. Whatever is left is tried again at the next start.
+    """
     if not is_packed_exe():
         return
     exe = running_exe()
-    for suffix in (".old", ".new", ".new.part"):
-        leftover = exe.with_name(exe.name + suffix)
-        try:
-            leftover.unlink()
-            log.info("Removed %s", leftover)
-        except FileNotFoundError:
-            pass
-        except OSError as e:  # the old program may still be closing; next time
-            log.info("Couldn't remove %s yet: %s", leftover, e)
+    left = [exe.with_name(exe.name + s) for s in (".old", ".new", ".new.part")]
+    for attempt in range(tries):
+        if attempt:
+            time.sleep(wait)
+        still = []
+        for leftover in left:
+            try:
+                leftover.unlink()
+                log.info("Removed %s", leftover)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                if attempt == tries - 1:
+                    log.info("Couldn't remove %s yet: %s", leftover, e)
+                still.append(leftover)
+        left = still
+        if not left:
+            return
