@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import urllib.error
 import webbrowser
@@ -31,7 +32,7 @@ from typing import Optional
 import flet as ft
 import pandas as pd
 
-from gradefiller import automation, matching, updater
+from gradefiller import automation, credentials, matching, settings, updater
 from gradefiller.round_line import RoundLine, tenth_label
 from gradefiller.paths import app_data_dir, resource_path, state_path
 from gradefiller.playwright_worker import PlaywrightWorker
@@ -62,7 +63,7 @@ def setup_logging() -> None:
     except OSError:
         log.addHandler(logging.NullHandler())  # logging must never stop the app
 
-STEP_LOGIN, STEP_EXCEL, STEP_GRID, STEP_MAP, STEP_RUN = range(5)
+STEP_EXCEL, STEP_GRID, STEP_MAP, STEP_RUN = range(4)
 
 ERROR = ft.Colors.RED_700
 OK = ft.Colors.GREEN_700
@@ -123,6 +124,9 @@ class GradeFillerApp:
 
         self.pw = PlaywrightWorker(dispatch=self._on_ui_thread)
         self.session: Optional[automation.PortalSession] = None
+        # Saved portal login (see credentials.py); filled in on the login page.
+        self.can_save_login = credentials.available()
+        self.saved_login: Optional[credentials.Login] = credentials.load() if self.can_save_login else None
         self.file_picker = ft.FilePicker()  # keep a reference: services are dropped otherwise
 
         # Step 2
@@ -153,13 +157,12 @@ class GradeFillerApp:
         self._running = False
 
         self.steps = [
-            self._build_step_login,
             self._build_step_excel,
             self._build_step_grid,
             self._build_step_mapping,
             self._build_step_run,
         ]
-        self.step_index = STEP_LOGIN
+        self.step_index = STEP_EXCEL
 
         self.page.window.prevent_close = True
         self.page.window.on_event = self._on_window_event
@@ -203,11 +206,11 @@ class GradeFillerApp:
 
     def _session(self) -> automation.PortalSession:
         if self.session is None:
-            self.session = automation.PortalSession(state_path())
+            self.session = automation.PortalSession(state_path(), saved_login=self.saved_login)
         return self.session
 
     def _build_header(self) -> ft.Control:
-        labels = ["Log In", "Grades File", "Course Table", "Match Columns", "Review & Fill"]
+        labels = ["Grades File", "Course Table", "Match Columns", "Review & Fill"]
         self.step_chips = []
         for i, label in enumerate(labels):
             chip = ft.Container(
@@ -217,8 +220,13 @@ class GradeFillerApp:
                 on_click=lambda _, i=i: self._chip_clicked(i),
             )
             self.step_chips.append(chip)
+        self.account_holder = ft.Container()
+        self._refresh_account()
         return ft.Container(
-            content=ft.Row(self.step_chips, spacing=8, wrap=True),
+            content=ft.Row(
+                [ft.Row(self.step_chips, spacing=8, wrap=True, expand=True), self.account_holder],
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
             padding=ft.Padding.symmetric(horizontal=24, vertical=16),
         )
 
@@ -276,94 +284,7 @@ class GradeFillerApp:
             return "The browser window was closed. Click the button again to reopen it."
         return first
 
-    # ---------- Step 1: Login ----------
-
-    def _build_step_login(self) -> ft.Control:
-        status = ft.Text("")
-        has_saved = state_path().exists()
-
-        confirm_btn = ft.FilledButton("I've logged in — continue", icon=ft.Icons.CHECK, visible=False)
-        open_btn_cls = ft.OutlinedButton if has_saved else ft.FilledButton
-        open_btn = open_btn_cls(
-            "Log in again" if has_saved else "Open browser to log in",
-            icon=ft.Icons.LOGIN,
-        )
-
-        def open_click(_):
-            open_btn.disabled = True
-            self._set_status(status, "Opening the browser…")
-            self.page.update()
-
-            def ok(_r):
-                open_btn.disabled = False
-                confirm_btn.visible = True
-                confirm_btn.disabled = False
-                self._set_status(
-                    status,
-                    "Log in in the browser window, then come back and click “I've logged in — continue”.",
-                )
-                self.page.update()
-
-            def err(e):
-                open_btn.disabled = False
-                self._set_status(status, f"Couldn't open the browser: {self._error_text(e)}", ERROR)
-                self.page.update()
-
-            self.pw.submit(self._session().open_login, ok, err)
-
-        def confirm_click(_):
-            confirm_btn.disabled = True
-            self._set_status(status, "Saving your login…")
-            self.page.update()
-
-            def err(e):
-                confirm_btn.disabled = False
-                self._set_status(status, self._error_text(e), ERROR)
-                self.page.update()
-
-            self.pw.submit(self._session().save_session, lambda _r: self._go_to(STEP_EXCEL), err)
-
-        open_btn.on_click = open_click
-        confirm_btn.on_click = confirm_click
-
-        controls = []
-        if has_saved:
-            controls += [
-                ft.Row(
-                    [
-                        ft.Icon(ft.Icons.CHECK_CIRCLE, color=ft.Colors.GREEN_600),
-                        ft.Text("You logged in on this computer before, so you can probably skip this."),
-                    ]
-                ),
-                ft.Row(
-                    [
-                        ft.FilledButton(
-                            "Continue with saved login",
-                            icon=ft.Icons.ARROW_FORWARD,
-                            on_click=lambda _: self._go_to(STEP_EXCEL),
-                        ),
-                        open_btn,
-                    ],
-                    wrap=True,
-                ),
-                ft.Text(
-                    "If the saved login has expired, the portal will just ask you to log in again later.",
-                    size=12,
-                    color=INFO,
-                ),
-            ]
-        else:
-            controls.append(open_btn)
-        controls += [confirm_btn, status]
-
-        return self._step_layout(
-            "Step 1: Log in to the portal",
-            "This opens a browser window. Log in as usual — your login is remembered "
-            "on this computer so you won't need to do it every time.",
-            controls,
-        )
-
-    # ---------- Step 2: Excel file ----------
+    # ---------- Step 1: Excel file ----------
 
     def _build_step_excel(self) -> ft.Control:
         path_text = ft.Text(self.excel_path or "No file selected", italic=self.excel_path is None, expand=True)
@@ -474,7 +395,7 @@ class GradeFillerApp:
         show_preview()
 
         return self._step_layout(
-            "Step 2: Choose your grades file",
+            "Step 1: Choose your grades file",
             "Pick the Excel file with the grades, then the sheet for this section. "
             "The first row of the sheet should be the column names.",
             [
@@ -494,60 +415,77 @@ class GradeFillerApp:
                 ft.Container(height=8),
                 next_btn,
             ],
-            back_to=STEP_LOGIN,
         )
 
-    # ---------- Step 3: Open the course grade table ----------
+    # ---------- Step 2: Open the course grade table ----------
 
     def _build_step_grid(self) -> ft.Control:
         status = ft.Text("")
-        open_btn = ft.OutlinedButton("Open the course list in the browser", icon=ft.Icons.OPEN_IN_BROWSER)
+        open_btn = ft.FilledButton("Open the portal", icon=ft.Icons.OPEN_IN_BROWSER)
         ready_btn = ft.FilledButton("The grade table is showing — continue", icon=ft.Icons.ARROW_FORWARD)
+
+        def show(msg, color=INFO):
+            self._set_status(status, msg, color)
+            self.page.update()
 
         def open_click(_):
             open_btn.disabled = True
-            self._set_status(status, "Opening…")
-            self.page.update()
+            show("Opening the portal and logging you in…" if self.saved_login else "Opening the portal…")
 
-            def ok(_r):
-                open_btn.disabled = False
-                self._set_status(
-                    status,
-                    "Now click through to the course, section and grade table in the browser. "
-                    "If the portal asks you to log in, do that first.",
+            def task():  # on the browser thread
+                session = self._session()
+                session.open_course_list()
+                if not session.on_login_page():
+                    return "open"
+                self._on_ui_thread(
+                    show,
+                    "Your saved password didn't work. Log in in the browser window with your current password."
+                    if self.saved_login else "Log in in the browser window.",
                 )
-                self.page.update()
+                logged_in = session.wait_for_manual_login()
+                self._hand_over_typed_login(session)
+                return "logged-in" if logged_in else "not-logged-in"
+
+            def ok(result):
+                open_btn.disabled = False
+                open_btn.content = "Open the portal again"
+                if result == "not-logged-in":
+                    show("Not logged in yet. Click “Open the portal again” to try once more.", WARN)
+                    return
+                show("Now go to the course and section in the browser and open its grade table, "
+                     "then come back here.")
 
             def err(e):
                 open_btn.disabled = False
-                self._set_status(status, f"Couldn't open the portal: {self._error_text(e)}", ERROR)
-                self.page.update()
+                show(f"Couldn't open the portal: {self._error_text(e)}", ERROR)
 
-            self.pw.submit(self._session().open_course_list, ok, err)
+            self.pw.submit(task, ok, err)
 
         def ready_click(_):
             ready_btn.disabled = True
             open_btn.disabled = True
-            self._set_status(status, "Looking for the grade table…")
-            self.page.update()
+            show("Looking for the grade table…")
             self._scan(
                 on_done=lambda: self._go_to(STEP_MAP),
                 on_fail=lambda msg: (
                     setattr(ready_btn, "disabled", False),
                     setattr(open_btn, "disabled", False),
-                    self._set_status(status, msg, ERROR),
-                    self.page.update(),
+                    show(msg, ERROR),
                 ),
             )
 
         open_btn.on_click = open_click
         ready_btn.on_click = ready_click
 
+        login_note = (
+            f"Grade Filler logs you in with the saved password for {self.saved_login.username}."
+            if self.saved_login else "If the portal asks you to log in, log in there."
+        )
         return self._step_layout(
-            "Step 3: Open the grade table",
-            "In the browser, go to the exact course and section you want to fill and open "
-            "its grade table (if it opens in a popup, leave the popup open). Every course's "
-            "table is different, so this part is up to you. Then come back here.",
+            "Step 2: Open the grade table",
+            "Click “Open the portal”. In the browser, go to the exact course and section and open its "
+            "grade table (if it opens in a popup, leave the popup open). Then come back here and click "
+            f"“The grade table is showing”. {login_note}",
             [ft.Row([open_btn, ready_btn], wrap=True), status],
             back_to=STEP_EXCEL,
         )
@@ -567,6 +505,7 @@ class GradeFillerApp:
             except Exception:
                 pass
             log.info("save_session: %.0f ms", _ms(t))
+            self._hand_over_typed_login(session)  # logged in by hand meanwhile
             return grids
 
         def ok(grids):
@@ -615,7 +554,7 @@ class GradeFillerApp:
         self.grid = scan.columns
         self.labels_found = scan.labels_found
 
-    # ---------- Step 4: Column mapping ----------
+    # ---------- Step 3: Column mapping ----------
 
     def _grid_col(self, index: Optional[int]) -> Optional[automation.GridColumn]:
         return next((g for g in self.grid if g.index == index), None)
@@ -1028,7 +967,7 @@ class GradeFillerApp:
 
         render()
         return self._step_layout(
-            "Step 4: Match columns",
+            "Step 3: Match columns",
             "",
             [holder],
             back_to=STEP_GRID,
@@ -1053,7 +992,7 @@ class GradeFillerApp:
         )
         self.plan = automation.build_fill_plan(self.job, self.df, portal_ids=idg.values)
 
-    # ---------- Step 5: Review, fill & save ----------
+    # ---------- Step 4: Review, fill & save ----------
 
     def _build_step_run(self) -> ft.Control:
         job, plan = self.job, self.plan
@@ -1256,7 +1195,7 @@ class GradeFillerApp:
         finish_btn.on_click = on_finish
 
         return self._step_layout(
-            "Step 5: Review and fill",
+            "Step 4: Review and fill",
             "Check the summary below. Filling types the grades into the portal table; "
             "nothing is saved until you click Save in the portal yourself.",
             [
@@ -1323,6 +1262,164 @@ class GradeFillerApp:
             actions=[ft.TextButton("OK", on_click=lambda _: self.page.pop_dialog())],
         )
         self.page.show_dialog(dlg)
+
+    # ---------- saved login + account corner ----------
+
+    @staticmethod
+    def _password_store_name() -> str:
+        return "Windows Credential Manager" if sys.platform == "win32" else "the macOS Keychain"
+
+    def _refresh_account(self):
+        if self.saved_login:
+            label = self.saved_login.username
+        elif state_path().exists():
+            label = "Portal account"
+        else:
+            self.account_holder.content = None
+            return
+        items = [
+            ft.PopupMenuItem(
+                content=ft.Text(
+                    f"Saved password for {self.saved_login.username}" if self.saved_login
+                    else "Password not saved", size=12, color=INFO,
+                ),
+                disabled=True,
+            ),
+            ft.PopupMenuItem(content=ft.Text("Switch account"), icon=ft.Icons.SWITCH_ACCOUNT,
+                             on_click=self._switch_account_clicked),
+        ]
+        if self.saved_login:
+            items.append(ft.PopupMenuItem(content=ft.Text("Forget my password"), icon=ft.Icons.KEY_OFF,
+                                          on_click=self._forget_password_clicked))
+        elif self.can_save_login and settings.get(settings.NEVER_ASK_TO_SAVE_PASSWORD):
+            items.append(ft.PopupMenuItem(content=ft.Text("Offer to save my password again"), icon=ft.Icons.KEY,
+                                          on_click=self._ask_again_clicked))
+        self.account_holder.content = ft.PopupMenuButton(
+            content=ft.Row(
+                [ft.Icon(ft.Icons.ACCOUNT_CIRCLE, color=ft.Colors.BLUE_GREY_600, size=20),
+                 ft.Text(label, size=13, weight=ft.FontWeight.W_500),
+                 ft.Icon(ft.Icons.ARROW_DROP_DOWN, color=ft.Colors.BLUE_GREY_600, size=18)],
+                spacing=4, tight=True,
+            ),
+            items=items,
+            menu_position=ft.PopupMenuPosition.UNDER,
+            tooltip="Your portal account",
+        )
+
+    def _use_saved_login(self, login: Optional[credentials.Login]):
+        """Remember login (or none) for this run, the corner and the browser."""
+        self.saved_login = login
+        self._refresh_account()
+        self.page.update()
+        if self.session is not None:
+            session = self.session
+            self.pw.submit(lambda: session.set_saved_login(login))
+
+    def _hand_over_typed_login(self, session: automation.PortalSession):
+        """On the browser thread: if the teacher just logged in by hand, ask
+        (on the UI thread) whether to save it. Called wherever a login can
+        finish, so it's never missed."""
+        typed = session.take_typed_login()
+        if typed:
+            self._on_ui_thread(self._offer_to_save_login, typed)
+
+    def _offer_to_save_login(self, typed: Optional[tuple[str, str]]):
+        if not typed or not self.can_save_login:
+            return
+        login = credentials.Login(*typed)
+        if login == self.saved_login:
+            return
+        update = self.saved_login is not None and self.saved_login.username == login.username
+        if not update and settings.get(settings.NEVER_ASK_TO_SAVE_PASSWORD):
+            return
+
+        def save(_):
+            self.page.pop_dialog()
+            if credentials.save(login):
+                self._use_saved_login(login)
+            else:
+                self._show_message("Couldn't save the password",
+                                   "Your password couldn't be saved on this computer. You can keep logging in by hand.")
+
+        def not_now(_):
+            self.page.pop_dialog()
+
+        def never(_):
+            self.page.pop_dialog()
+            settings.set(settings.NEVER_ASK_TO_SAVE_PASSWORD, True)
+            self._refresh_account()
+            self.page.update()
+
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Update your saved password?" if update else "Save your portal password?"),
+                content=ft.Text(
+                    f"Next time, Grade Filler can log in to the portal for you as {login.username}.\n\n"
+                    f"The password is kept in {self._password_store_name()} on this computer, not in a file. "
+                    "Anyone who can use your account on this computer could log in with it, "
+                    "so only save it on your own computer."
+                ),
+                actions=[
+                    *([] if update else [ft.TextButton("Don't ask again", on_click=never)]),
+                    ft.TextButton("Not now", on_click=not_now),
+                    ft.FilledButton("Update password" if update else "Save password", on_click=save),
+                ],
+            )
+        )
+
+    def _ask_again_clicked(self, _=None):
+        settings.set(settings.NEVER_ASK_TO_SAVE_PASSWORD, False)
+        self._refresh_account()
+        self._show_message("Okay", "Next time you log in to the portal, Grade Filler will offer to save your password.")
+
+    def _forget_password_clicked(self, _=None):
+        credentials.forget()
+        self._use_saved_login(None)
+        self._show_message("Password removed",
+                           "Your saved password was removed from this computer. You'll log in by hand from now on.")
+
+    def _switch_account_clicked(self, _=None):
+        if self._running:
+            self._show_message("Please wait", "Grade Filler is filling grades. Switch accounts when it has finished.")
+            return
+
+        def go(_):
+            self.page.pop_dialog()
+            credentials.forget()
+            if self.session is not None:
+                self.session.stop_waiting = True  # if it's waiting on the login page
+            self._use_saved_login(None)
+
+            def task():
+                self._session().log_out()
+
+            def done(_r=None):
+                self._refresh_account()
+                if self.step_index >= STEP_GRID:
+                    self._go_to(STEP_GRID)  # the table belonged to the other account
+                else:
+                    self.page.update()
+
+            self.pw.submit(task, done, lambda e: done())
+
+        forget = f" and forgets the saved password for {self.saved_login.username}" if self.saved_login else ""
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Switch account?"),
+                content=ft.Text(
+                    f"This logs you out of the portal{forget}. "
+                    "Then log in with the other account when you open the portal.\n\n"
+                    "Did you fill grades in the portal without clicking the portal's Save button yet? "
+                    "Then click Cancel and save first, or the grades will be lost."
+                ),
+                actions=[
+                    ft.TextButton("Cancel", on_click=lambda _: self.page.pop_dialog()),
+                    ft.FilledButton("Switch account", on_click=go),
+                ],
+            )
+        )
 
     # ---------- update notice ----------
 
@@ -1475,6 +1572,8 @@ class GradeFillerApp:
 
     def _shut_down(self):
         self._stop_requested = True
+        if self.session is not None:
+            self.session.stop_waiting = True
         closed = threading.Event()
 
         def destroy(*_):

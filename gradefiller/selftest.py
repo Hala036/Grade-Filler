@@ -11,6 +11,22 @@ import traceback
 from pathlib import Path
 
 
+def _password_store_check() -> str:
+    """Write, read back and delete a dummy entry (never the real saved login)."""
+    import keyring
+
+    kr = keyring.get_keyring()
+    name = f"{type(kr).__module__}.{type(kr).__name__}"
+    try:
+        service = "Grade Filler self-test"
+        keyring.set_password(service, "probe", "ok-123")
+        back = keyring.get_password(service, "probe")
+        keyring.delete_password(service, "probe")
+        return f"password store: {'ok' if back == 'ok-123' else 'READ BACK WRONG'} ({name})"
+    except Exception as e:  # noqa: BLE001
+        return f"password store: FAILED ({name}: {type(e).__name__}: {e})"
+
+
 def run(report: Path = Path("selftest.txt")) -> int:
     lines = []
     try:
@@ -25,6 +41,7 @@ def run(report: Path = Path("selftest.txt")) -> int:
         lines.append("imports: ok")
         lines.append(f"version: {__version__}")
         lines.append(f"packed exe: {updater.is_packed_exe()} ({updater.running_exe()})")
+        lines.append(_password_store_check())
         from gradefiller.paths import resource_path
 
         icon = resource_path("assets/icon.ico")

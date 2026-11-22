@@ -9,6 +9,7 @@ Excel-column -> portal-column mappings.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -31,8 +32,55 @@ from playwright.sync_api import (
     Error as PwError,
 )
 
-PORTAL_LOGIN_URL = "https://portal.alquds.edu/en/login"
 COURSE_PAGE_URL = "https://portal.alquds.edu/en/registration/marks/course_list"
+# The university's single sign-on page the portal sends you to for logging in
+# (a SimpleSAMLphp form: #username, #password, #submit_button).
+SSO_HOST = "login.alquds.edu"
+
+# Runs in every page of our browser, before the page's own scripts; acts only
+# on the login page. It (1) tells Python what the teacher typed when they log
+# in, so the app can offer to save it, and (2) if a login is saved, fills it in
+# and presses Log in. It presses at most once per 2 minutes per tab, so a wrong
+# saved password never loops (the teacher then sees the page's error and types
+# the new one). The saved login comes from window.__gfLogin, set by
+# _LOGIN_CONFIG_JS; the newest of those wins, because this waits until the page
+# has loaded.
+_LOGIN_PAGE_JS = r"""
+(() => {
+  const host = %s;
+  if (location.hostname !== host) return;
+  const ready = () => {
+    const u = document.querySelector('#username'), p = document.querySelector('#password');
+    if (!u || !p) return;
+    const report = () => { try { window.gfLoginTyped(u.value, p.value); } catch (e) {} };
+    const form = p.form;
+    if (form) form.addEventListener('submit', report, true);
+    document.addEventListener('click', e => {
+      if (e.target.closest && e.target.closest('#submit_button, [type=submit]')) report();
+    }, true);
+    p.addEventListener('keydown', e => { if (e.key === 'Enter') report(); }, true);
+
+    const saved = window.__gfLogin;
+    if (!saved) return;
+    if (u.value || p.value) {  // the page kept the username: the login just failed
+      window.__gfLoginFailed = true;
+      return;
+    }
+    u.value = saved.username;
+    p.value = saved.password;
+    let last = 0;
+    try { last = +sessionStorage.getItem('gfAutoLogin') || 0; } catch (e) {}
+    if (Date.now() - last < 120000) return;
+    try { sessionStorage.setItem('gfAutoLogin', String(Date.now())); } catch (e) {}
+    const btn = document.querySelector('#submit_button') || (form && form.querySelector('[type=submit], button'));
+    if (form && form.requestSubmit) form.requestSubmit(btn && btn.form === form ? btn : undefined);
+    else if (btn) btn.click();
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ready);
+  else ready();
+})();
+"""
+_LOGIN_CONFIG_JS = "if (location.hostname === %s) window.__gfLogin = %s;"
 
 log = logging.getLogger("gradefiller")
 
@@ -218,8 +266,14 @@ class PortalSession:
     (with the saved login, if any).
     """
 
-    def __init__(self, state_path: Path):
+    def __init__(self, state_path: Path, saved_login=None, sso_host: str = SSO_HOST):
         self.state_path = state_path
+        self.sso_host = sso_host
+        self.saved_login = saved_login  # credentials.Login or None: filled in for the teacher
+        # What the teacher last typed on the login page (username, password),
+        # kept in memory only, until the app asks whether to save it.
+        self.typed_login: Optional[tuple[str, str]] = None
+        self.stop_waiting = False  # set from the UI to end wait_for_manual_login early
         self._playwright = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
@@ -237,12 +291,13 @@ class PortalSession:
     # "playwright install chromium"). Using an installed browser keeps the
     # .exe small and needs no download on the teacher's laptop.
     BROWSER_CHANNELS = ("msedge", "chrome", None)
+    HEADLESS = False  # tests run without a window
 
     def _launch_browser(self) -> Browser:
         errors = []
         for channel in self.BROWSER_CHANNELS:
             try:
-                browser = self._playwright.chromium.launch(headless=False, channel=channel)
+                browser = self._playwright.chromium.launch(headless=self.HEADLESS, channel=channel)
                 log.info("browser: %s", channel or "playwright chromium")
                 return browser
             except PwError as e:
@@ -271,17 +326,111 @@ class PortalSession:
                 self.context = None
         if self.context is None:
             self.context = self.browser.new_context()
+        self._watch_login_page()
         self.page = self.context.new_page()
 
-    def open_login(self) -> None:
-        self._ensure_browser()
-        self.page.goto(PORTAL_LOGIN_URL, wait_until="domcontentloaded")
-        self.page.bring_to_front()
+    def _watch_login_page(self) -> None:
+        def typed(_source, username, password):
+            if username and password:
+                login = (str(username).strip(), str(password))
+                if login != self.typed_login:
+                    log.info("Login page: a username and password were entered")
+                self.typed_login = login
 
-    def open_course_list(self) -> None:
+        self.context.expose_binding("gfLoginTyped", typed)
+        self.context.add_init_script(_LOGIN_PAGE_JS % json.dumps(self.sso_host))
+        self._send_saved_login()
+
+    def _send_saved_login(self) -> None:
+        login = self.saved_login
+        data = {"username": login.username, "password": login.password} if login else None
+        self.context.add_init_script(_LOGIN_CONFIG_JS % (json.dumps(self.sso_host), json.dumps(data)))
+
+    def set_saved_login(self, login) -> None:
+        """Use this login (or None) on the next login page, without restarting the browser."""
+        self.saved_login = login
+        if self._alive():
+            self._send_saved_login()
+
+    def take_typed_login(self) -> Optional[tuple[str, str]]:
+        """What the teacher typed on the login page, once they're past it (then
+        cleared). None while still on the login page: it may have been wrong."""
+        if self.typed_login is None or self.on_login_page():
+            return None
+        typed, self.typed_login = self.typed_login, None
+        return typed
+
+    def on_login_page(self) -> bool:
+        try:
+            return bool(self.page and not self.page.is_closed() and self.sso_host in self.page.url)
+        except PwError:
+            return False
+
+    def log_out(self) -> None:
+        """Forget the portal login in the browser and on disk (for "Switch account")."""
+        self.typed_login = None
+        if self._alive():
+            self.context.clear_cookies()
+        try:
+            self.state_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def open_course_list(self, url: str = COURSE_PAGE_URL) -> None:
+        """Open the course list. If the portal asks to log in and a login is
+        saved, the login page signs in by itself; wait for that and come back."""
         self._ensure_browser()
-        self.page.goto(COURSE_PAGE_URL, wait_until="domcontentloaded")
+        self.page.goto(url, wait_until="domcontentloaded")
         self.page.bring_to_front()
+        if self.saved_login and self.on_login_page():
+            if not self._wait_for_auto_login():
+                log.info("Saved login didn't get past the login page")
+                return  # wrong/old password: the teacher logs in by hand
+            log.info("Logged in with the saved password")
+            self.save_session()  # keep the fresh login
+            if self.page.url.split("?")[0] != url:
+                self.page.goto(url, wait_until="domcontentloaded")
+
+    def wait_for_manual_login(self, url: str = COURSE_PAGE_URL, timeout_s: float = 600) -> bool:
+        """While the teacher logs in by hand: wait until they're past the login
+        page, keep the new login and go to url. False if they closed the
+        browser, took too long, or stop_waiting was set."""
+        self.stop_waiting = False
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline and not self.stop_waiting:
+            try:
+                if not self._alive() or self.page is None or self.page.is_closed():
+                    return False
+                if self.sso_host not in self.page.url:
+                    self.page.wait_for_load_state("domcontentloaded")
+                    log.info("Logged in by hand")
+                    self.save_session()
+                    if self.page.url.split("?")[0] != url:
+                        self.page.goto(url, wait_until="domcontentloaded")
+                    return True
+                self.page.wait_for_timeout(500)
+            except PwError:
+                return False
+        return False
+
+    def _wait_for_auto_login(self, timeout_s: float = 20) -> bool:
+        """True once the browser has left the login page; False if the login
+        page said no (or nothing happened in time)."""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if not self.on_login_page():
+                try:
+                    self.page.wait_for_load_state("domcontentloaded")
+                except PwError:
+                    pass
+                return True
+            try:
+                if self.page.evaluate("() => window.__gfLoginFailed === true"):
+                    return False
+            except PwError:
+                pass  # mid-navigation
+            self.page.wait_for_timeout(250)
+        return False
 
     def save_session(self) -> None:
         if not self._alive():
