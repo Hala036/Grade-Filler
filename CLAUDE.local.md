@@ -12,7 +12,7 @@
 > comes with every download. (The user lost an earlier set of notes once.) Commit
 > your updates to it along with your code changes.
 
-**Last updated:** 2026-11-20 · **Released: v1.0.0** (first Windows `.exe`, tag on `main`) · **`main`:** current, working version · **Work happens on one branch per feature**, merged into `main` by pull request
+**Last updated:** 2026-11-21 · **Released: v1.0.0** (first Windows `.exe`, tag on `main`) · **`main`:** current, working version · **`update-notice`:** self-update, pushed, PR open, waiting for the Windows test · **Work happens on one branch per feature**, merged into `main` by pull request
 
 ## What this is
 
@@ -37,6 +37,9 @@ double-click `.exe` with no terminal at all.
 | `gradefiller/automation.py` | All browser + Excel work: `PortalSession`, grid discovery (`find_grids`, `GridInfo`), `scan_grid`, `load_sheet` / `excel_display_text`, `build_fill_plan`, `run_fill`, `edit_cell_commit` |
 | `gradefiller/matching.py` | Pure auto-matching: ID pair by shared values, grade pairs by name similarity |
 | `gradefiller/playwright_worker.py` | One thread owns Playwright (sync API is thread-bound); UI submits tasks |
+| `gradefiller/updater.py` | Update notice + self-update: asks GitHub's `releases/latest` API, downloads the new `.exe` (size + SHA-256 checked), swaps it in, restarts. No UI code |
+| `gradefiller/_version.py` | The running version. `"0.0.0"` in git; the build overwrites it with the tag's number |
+| `tests/` | `python -m unittest discover tests` (built-in, no extra installs). So far: `test_updater.py` |
 | `gradefiller/paths.py` | Saved login → `%APPDATA%\GradeFiller\state.json` / `~/Library/Application Support/GradeFiller` |
 
 ## Run it
@@ -63,6 +66,9 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 - **Optional round-up (off by default)** is the one exception to "no rounding". It goes by the first digit after the point, chosen per digit. The teacher's usual rule: .1–.4 up to .5, .5–.9 up to the next whole number (12.2 → 12.5, 12.5 → 13, 12 stays 12). Rounding must never lower a grade.
 
 ## Recent fixes (newest first)
+
+- **Update notice + self-update** (branch `update-notice`, 2026-11-21). At startup (packed Windows `.exe` only) a background thread asks `api.github.com/repos/Hala036/Grade-Filler/releases/latest`; if its tag is newer than `_version.__version__`, an amber bar shows "A new version of Grade Filler (X) is available. [Update] [Not now]". Update → confirm dialog (warns to click the portal's Save first, since the browser closes) → download to `GradeFiller.exe.new` with a progress bar → checks `MZ` header, size and the `sha256:` digest GitHub reports → renames the running `.exe` to `.old` (Windows allows renaming a running exe), moves the new one in, starts it with `PYINSTALLER_RESET_ENVIRONMENT=1`, closes via `_shut_down()`. On failure: "Try again" / "Download it myself"; the old `.exe` is put back if the swap fails. The next start deletes `.old`, retrying for ~30 s in its own thread (the old program may still be closing its browser). Offline at startup → nothing shown (logged). Folder not writable → Update opens the download in the browser instead. Version: the workflow writes `_version.py` from the tag; the self-test prints `version: X` and the build fails if it's wrong. HTTPS falls back to `certifi`'s certificates if the system's fail (python.org Python on macOS has none). Test builds are `0.0.0`, so they are always offered the latest release; handy for testing the swap. Run from source with `GRADEFILLER_CHECK_UPDATES=1` to see the bar (Update then just opens the download). **Not done (user agreed, 2026-11-21):** downloading into a hidden temp folder. `%TEMP%` can be on another drive than the `.exe`, which turns the instant rename into a slow copy that can fail halfway; the `.new` file next to the app for ~1 minute is the accepted cost. **Checked:** 14 unit tests; the live GitHub check (it returns v1.0.0, 117 MB, with digest); the bar's 3 states rendered with `ft.Screenshot`. **Not yet tested on Windows** (the real swap + restart).
+  - **The teacher must download the first version that has this by hand, once.** v1.0.0 has no updater, so it can't announce anything.
 
 - **App icon** (branch `windows-exe`): the user's A+ image, cropped and turned into `assets/icon.ico`; set on the `.exe` and the app window; the self-test fails if it isn't bundled. **Tested on the Windows computer (2026-11-20): everything works**; the icon showed in the taskbar but not on the desktop. Checked: the icon *is* embedded in the `.exe` (all 7 sizes extracted from the build). Cause: Windows' icon cache remembered the first, icon-less `GradeFiller.exe`. Fix: rename the file, or Win+R → `ie4uinit.exe -show`, or restart. A fresh laptop isn't affected.
 
@@ -97,13 +103,12 @@ New computer without git: download https://github.com/Hala036/Grade-Filler/archi
 - [x] **Edit focus click on the ID cell: confirmed on the real portal** (user, 2026-11-20). Grades are filled correctly and stay in their cells; each value is committed with Tab.
 - [x] **Header labels: confirmed on the real portal** (user, 2026-11-20). The popup's two-row header (`Mark` spans First 25 / Second 25 / Third 10) is laid out honouring rowspan/colspan in `_DISCOVER_JS`; each column takes its lowest name.
 - [x] Merged `improving-UI` → `main` after a successful real run (2026-11-20).
-- [ ] No automated tests in the repo yet. Earlier checks were throwaway scripts: fake DHTMLX pages + headless Chromium, and a stub Flet page driving each step. Worth adding under `tests/`.
+- [ ] Only the updater has automated tests (`tests/`). Earlier checks were throwaway scripts: fake DHTMLX pages + headless Chromium, and a stub Flet page driving each step. Worth adding under `tests/`.
 - [x] Fixed: the `#` row-number column (values 1, 2, 3 …) and unnamed empty spacer columns are no longer offered as fill targets; name matching uses the max mark as a tie-breaker (`First 25` → `First/25`, not `First/30`) (`matching._split_label`, `_similarity`, `portal_fillable_columns`).
 
 ## Next features
 
-1. **Update notice / self-update (next, own branch).** Until then every new version must be downloaded by hand. Plan: at startup check `releases/latest` on GitHub; if newer than the running version, show "A new version (X) is available. [Update]"; download the new `.exe`, swap it in (rename the running one to `.old`, since Windows can't overwrite a running `.exe`), restart. Needs the version baked into the build (e.g. a generated `gradefiller/_version.py` in the workflow).
-   - Done before this: v1.0.0, the Windows `.exe` (PRs #1, #2). Tested on the Windows computer 2026-11-20.
+1. **Finish the update notice. Test plan:** (a) on the Windows computer, run the PR's test build (0.0.0). The bar offers v1.0.0; Update should download, swap and reopen as v1.0.0. The `.old` file stays because v1.0.0 has no clean-up code; that's expected, so delete it by hand. (b) Merge and tag. (c) Run the 0.0.0 test build again: it now updates to the new release, and the `.old` file should vanish within ~30 s. No need for two releases in a row.
 2. Whatever the user asks for next. Add it here.
    - Possible: remember the round-up setting between runs (today it resets each launch).
    - The local sample sheet `2251-1214311-sec1-Grades.xlsx` (gitignored) was removed from the folder on 2026-11-20; tests since then use made-up data.

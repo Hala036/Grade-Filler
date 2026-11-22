@@ -19,7 +19,10 @@ owns one dedicated thread for the whole browser session's lifetime.
 from __future__ import annotations
 
 import logging
+import os
 import threading
+import urllib.error
+import webbrowser
 from logging.handlers import RotatingFileHandler
 import time
 import traceback
@@ -28,7 +31,7 @@ from typing import Optional
 import flet as ft
 import pandas as pd
 
-from gradefiller import automation, matching
+from gradefiller import automation, matching, updater
 from gradefiller.round_line import RoundLine, tenth_label
 from gradefiller.paths import app_data_dir, resource_path, state_path
 from gradefiller.playwright_worker import PlaywrightWorker
@@ -163,14 +166,23 @@ class GradeFillerApp:
 
         self.body = ft.Container(expand=True, padding=24)
         self.header = self._build_header()
+        self.update_bar = ft.Container(
+            visible=False,
+            bgcolor=ft.Colors.AMBER_50,
+            padding=ft.Padding.symmetric(horizontal=24, vertical=10),
+            border=ft.Border.only(bottom=ft.BorderSide(1, ft.Colors.AMBER_200)),
+        )
+        self.release: Optional[updater.Release] = None
+        self._updating = False
         self.page.add(
             ft.Column(
-                [self.header, ft.Divider(height=1), self.body],
+                [self.update_bar, self.header, ft.Divider(height=1), self.body],
                 expand=True,
                 spacing=0,
             )
         )
         self._render_step()
+        self._start_update_check()
 
     # ---------- shell ----------
 
@@ -1312,11 +1324,156 @@ class GradeFillerApp:
         )
         self.page.show_dialog(dlg)
 
+    # ---------- update notice ----------
+
+    def _start_update_check(self):
+        """Ask GitHub for a newer version in the background; show the bar if so.
+
+        Only the packed .exe checks. GRADEFILLER_CHECK_UPDATES=1 makes a run from
+        source check too (its Update button then just opens the download).
+        """
+        if not (updater.is_packed_exe() or os.environ.get("GRADEFILLER_CHECK_UPDATES")):
+            return
+
+        # Its own thread: it may wait for the old version to finish closing.
+        threading.Thread(target=updater.clean_up_old, name="update-cleanup", daemon=True).start()
+
+        def work():
+            try:
+                release = updater.check_for_update()
+            except Exception as e:  # noqa: BLE001  offline etc.: say nothing
+                log.info("Update check failed: %s", e)
+                return
+            if release:
+                self._on_ui_thread(self._show_update_offer, release)
+
+        threading.Thread(target=work, name="update-check", daemon=True).start()
+
+    def _set_update_bar(self, text: str, buttons: list, progress: Optional[ft.ProgressBar] = None) -> ft.Text:
+        message = ft.Text(text, size=14, expand=True)
+        row = ft.Row(
+            [
+                ft.Icon(ft.Icons.SYSTEM_UPDATE_ALT, color=ft.Colors.AMBER_900, size=20),
+                message,
+                *buttons,
+            ],
+            spacing=12,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        self.update_bar.content = ft.Column([row, progress], spacing=6) if progress else row
+        self.update_bar.visible = True
+        self.page.update()
+        return message
+
+    def _hide_update_bar(self, _=None):
+        self.update_bar.visible = False
+        self.page.update()
+
+    def _show_update_offer(self, release: updater.Release):
+        self.release = release
+        self._set_update_bar(
+            f"A new version of Grade Filler ({release.version}) is available.",
+            [
+                ft.FilledButton("Update", icon=ft.Icons.DOWNLOAD, on_click=self._update_clicked),
+                ft.TextButton("Not now", on_click=self._hide_update_bar),
+            ],
+        )
+
+    def _update_clicked(self, _=None):
+        if self._running:
+            self._show_message("Please wait", "Grade Filler is filling grades. Update when it has finished.")
+            return
+        if not (updater.is_packed_exe() and updater.can_replace(updater.running_exe())):
+            # Can't swap the file here: let the browser download it instead.
+            webbrowser.open(self.release.url)
+            self._set_update_bar(
+                "The new version is downloading in your web browser. "
+                "Close Grade Filler and open the downloaded file.",
+                [ft.TextButton("OK", on_click=self._hide_update_bar)],
+            )
+            return
+
+        def go(_):
+            self.page.pop_dialog()
+            self._run_update()
+
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Update Grade Filler?"),
+                content=ft.Text(
+                    "Grade Filler and its browser window will close, then the new version opens "
+                    "by itself. This takes about a minute.\n\n"
+                    "Did you fill grades in the portal without clicking the portal's Save button yet? "
+                    "Then click Cancel and save first, or the grades will be lost."
+                ),
+                actions=[
+                    ft.TextButton("Cancel", on_click=lambda _: self.page.pop_dialog()),
+                    ft.FilledButton("Update now", on_click=go),
+                ],
+            )
+        )
+
+    def _run_update(self):
+        release = self.release
+        self._updating = True
+        bar = ft.ProgressBar(value=0)
+        label = "Downloading the new version…"
+        message = self._set_update_bar(label, [], bar)
+        shown = {"pct": -1}
+
+        def progress(done: int, total: int):  # on the download thread
+            pct = int(done * 100 / total) if total else 0
+            if pct != shown["pct"]:
+                shown["pct"] = pct
+                self._on_ui_thread(show_progress, pct)
+
+        def show_progress(pct: int):
+            if self._updating:
+                bar.value = pct / 100
+                message.value = f"{label} {pct}%"
+                self.page.update()
+
+        def done():
+            self._set_update_bar("Opening the new version…", [])
+            self._shut_down()
+
+        def failed(e: Exception):
+            self._updating = False
+            if isinstance(e, ValueError):
+                reason = str(e)
+            elif isinstance(e, urllib.error.URLError) or isinstance(e, TimeoutError):
+                reason = "check the internet connection"
+            else:
+                reason = "the file couldn't be replaced"
+            self._set_update_bar(
+                f"The update didn't work ({reason}). Nothing was changed.",
+                [
+                    ft.FilledButton("Try again", on_click=lambda _: self._run_update()),
+                    ft.TextButton("Download it myself", on_click=lambda _: webbrowser.open(release.url)),
+                    ft.TextButton("Not now", on_click=self._hide_update_bar),
+                ],
+            )
+
+        def work():
+            try:
+                updater.install_update(release, progress)
+            except Exception as e:  # noqa: BLE001
+                log.info("Update failed: %s", traceback.format_exc())
+                self._on_ui_thread(failed, e)
+                return
+            self._on_ui_thread(done)
+
+        threading.Thread(target=work, name="update", daemon=True).start()
+
     # ---------- shutdown ----------
 
     def _on_window_event(self, e):
         if e.type != ft.WindowEventType.CLOSE:
             return
+        self._shut_down()
+
+    def _shut_down(self):
         self._stop_requested = True
         closed = threading.Event()
 

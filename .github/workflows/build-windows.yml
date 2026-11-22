@@ -40,6 +40,8 @@ jobs:
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"; else v="0.0.0"; fi
           echo "number=$v" >> "$GITHUB_OUTPUT"
+          # Baked into the .exe so it knows which version it is (update notice).
+          printf '__version__ = "%s"\n' "$v" > gradefiller/_version.py
 
       - name: Pack GradeFiller.exe
         run: >
@@ -62,6 +64,7 @@ jobs:
           Get-Content selftest.txt
           if ($p.ExitCode -ne 0) { throw "Self-test failed (exit code $($p.ExitCode))" }
           if (-not (Select-String -Path selftest.txt -Pattern "msedge: ok" -Quiet)) { throw "Edge didn't start" }
+          if (-not (Select-String -Path selftest.txt -Pattern "version: ${{ steps.version.outputs.number }}" -SimpleMatch -Quiet)) { throw "Wrong version inside the .exe" }
 
       - uses: actions/upload-artifact@v4
         with:
