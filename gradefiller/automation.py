@@ -151,32 +151,50 @@ def parse_grade(x) -> Optional[str]:
     return s
 
 
+ROUND_STEPS = 20  # the round-up line goes 0..1 in steps of 0.05
+
+
+def step_value(n: int) -> Decimal:
+    """A point on the round-up line (0..ROUND_STEPS) as a number: 3 -> 0.15."""
+    return Decimal(n) / ROUND_STEPS
+
+
+def step_label(n: int) -> str:
+    """3 -> "0.15", 10 -> "0.5", 20 -> "1"."""
+    return format(step_value(n).normalize(), "f")
+
+
 @dataclass(frozen=True)
 class RoundUp:
-    """Optional round-up, decided by the first digit after the decimal point.
+    """Optional rounding, decided by the part after the decimal point.
 
-    Two joined arrows on a 0-1 line, in tenths (0..10), start <= joint <= end:
-      * digits start .. joint-1 go up to .joint   (the first, amber arrow)
-      * digits joint .. end-1   go up to .end     (the second, green arrow;
-        end 10 means the next whole number)
-      * anything else stays, and whole numbers never change.
-    The teacher's usual rule is (1, 5, 10): .1-.4 -> .5, .5-.9 -> next whole.
-    An arrow only points forward, so a grade never goes down.
+    Two joined arrows on a 0-1 line, in steps of 0.05 (0..20),
+    start <= joint <= end:
+      * below start: the decimals are dropped (12.1 -> 12)
+      * start up to joint: up to .joint   (the first, amber arrow)
+      * joint up to end:   up to .end     (the second, green arrow;
+        end 20 means the next whole number)
+      * end and above stays, and whole numbers never change.
+    The teacher's usual rule is (2, 10, 20): .1-.49 -> .5, .5-.99 -> next
+    whole, and .01-.09 -> .0. Only the decimals below the first arrow ever go
+    down (the user's choice, 2026-11-22).
     """
-    start: int = 1
-    joint: int = 5
-    end: int = 10
+    start: int = 2
+    joint: int = 10
+    end: int = 20
 
     def __post_init__(self):
-        if not 0 <= self.start <= self.joint <= self.end <= 10:
+        if not 0 <= self.start <= self.joint <= self.end <= ROUND_STEPS:
             raise ValueError(f"round-up points out of order: {self}")
 
-    def target(self, digit: int) -> Optional[int]:
-        """Where a first decimal digit (0-9) goes, in tenths; None if it stays."""
-        if self.start <= digit < self.joint:
-            return self.joint
-        if self.joint <= digit < self.end:
-            return self.end
+    def target(self, frac: Decimal) -> Optional[Decimal]:
+        """Where a decimal part (0 < frac < 1) goes; None if it stays."""
+        if frac < step_value(self.start):
+            return Decimal(0)
+        if frac < step_value(self.joint):
+            return step_value(self.joint)
+        if frac < step_value(self.end):
+            return step_value(self.end)
         return None
 
     @property
@@ -196,10 +214,10 @@ def apply_round_up(text: str, rule: RoundUp) -> str:
     frac = d - whole
     if frac == 0:
         return text
-    target = rule.target(int(frac * 10))  # first digit after the point
+    target = rule.target(frac)
     if target is None:
         return text
-    return format((whole + Decimal(target) / 10).normalize(), "f")
+    return format((whole + target).normalize(), "f")
 
 
 def looks_numeric(values, threshold: float = 0.6) -> bool:
@@ -233,7 +251,7 @@ class FillJob:
     sheet_name: str
     id_mapping: ColumnMapping
     grade_mappings: list[ColumnMapping] = field(default_factory=list)
-    blank_as_zero: bool = False
+    zero_as_blank: bool = True  # a 0 in Excel leaves the portal cell as it is, like a blank cell
     round_up: Optional[RoundUp] = None  # None: type grades exactly as Excel shows them
     pace_seconds: float = PACE_SECONDS_DEFAULT
 
@@ -834,6 +852,7 @@ class FillPlan:
     duplicate_ids: list[str] = field(default_factory=list)
     invalid_cells: list[str] = field(default_factory=list)
     blank_cells: int = 0
+    zero_cells: int = 0  # 0 in Excel, left as they are (zero_as_blank)
     rows_without_id: int = 0
     rounded: list[str] = field(default_factory=list)  # e.g. "Row 5 (2201…), 'Quiz': 12.3 → 12.5"
 
@@ -879,11 +898,11 @@ def build_fill_plan(job: FillJob, df: pd.DataFrame, portal_ids: Optional[list[st
                 )
                 continue
             if value is None:
-                if job.blank_as_zero:
-                    value = "0"
-                else:
-                    plan.blank_cells += 1
-                    continue
+                plan.blank_cells += 1
+                continue
+            if job.zero_as_blank and Decimal(value) == 0:
+                plan.zero_cells += 1
+                continue
             if job.round_up is not None:
                 new = apply_round_up(value, job.round_up)
                 if new != value:
